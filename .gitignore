@@ -1,0 +1,76 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.pytest_tmp/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+.venv-linux/
+venv/
+env/
+ENV/
+
+# Build and packaging output
+build/
+build_verify/
+build_verify_project_runtime/
+dist/
+dist_verify/
+dist_verify_project_runtime/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local runtimes and generated profiles
+playwright_runtime/
+chatgpt-profile-run/
+
+# Logs and local state
+logs/
+*.log
+*.sqlite3
+*.db
+server_requests.log
+translation_session.json
+translation_stats.json
+context_glossary.json
+settings.json
+.epub_translator_openrouter.json
+
+# Generated output and archives
+books/
+output/
+result/
+consistency_session.json
+tools/tomato/config.yml
+tools/tomato/*/
+output/codex_covers/
+*_translated.html
+*_translated_openrouter.html
+*_openrouter_failed.html
+*.epub
+translatorFork_MOD.zip
+translatorFork_MOD-v*.zip
+translatorFork_MOD-source-*.zip
+
+# Temporary local files
+_tmp_*
+
+# OS and editor files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+.worktrees/
+
+# Сгенерированные конфиги и результаты бенчмарка промптов
+# (содержат текст глав и глоссарий проекта, собираются локально)
+benchmarks/*.json
+!benchmarks/prompt_benchmark.example.json
+benchmark_results/

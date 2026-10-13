@@ -1,0 +1,109 @@
+# -*- mode: python ; coding: utf-8 -*-
+import runpy
+from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_data_files
+
+
+_BUILD_CONFIG = runpy.run_path(str(Path(SPECPATH) / "pyinstaller_config.py"))
+LAZY_HANDLER_HIDDEN_IMPORTS = _BUILD_CONFIG["LAZY_HANDLER_HIDDEN_IMPORTS"]
+LAZY_SERVER_HIDDEN_IMPORTS = _BUILD_CONFIG["LAZY_SERVER_HIDDEN_IMPORTS"]
+
+
+PROJECT_ROOT = Path.cwd()
+
+
+def discover_ranobelib_source_data():
+    base_dir = PROJECT_ROOT / "ranobelib"
+    if not (base_dir / "main_window.py").exists():
+        return []
+
+    return [
+        (str(file_path), "ranobelib")
+        for file_path in sorted(base_dir.iterdir())
+        if file_path.is_file()
+        and file_path.suffix.lower() in {".py", ".mjs"}
+        and ".bak" not in file_path.name
+    ]
+
+
+datas = [
+    ('config', 'config'),
+    ('README.md', '.'),
+    ('gemini_translator\\scripts\\chatgpt_workascii_bridge.cjs', 'gemini_translator\\scripts'),
+    ('gemini_translator\\scripts\\chatgpt_profile_launcher.cjs', 'gemini_translator\\scripts'),
+    ('qidian_rulate\\tags.txt', 'qidian_rulate'),
+    ('tools\\tomato', 'tools\\tomato'),
+    ('playwright_runtime\\node.exe', 'playwright_runtime'),
+    ('playwright_runtime\\package', 'playwright_runtime\\package'),
+    ('playwright_runtime\\ms-playwright', 'playwright_runtime\\ms-playwright'),
+]
+datas += [
+    (name, '.')
+    for name in ('ffmpeg.exe', 'ffprobe.exe')
+    if (PROJECT_ROOT / name).exists()
+]
+datas += discover_ranobelib_source_data()
+datas += collect_data_files('PyQt6')
+datas += collect_data_files('certifi')
+datas += collect_data_files('docx')
+datas += collect_data_files('emoji')
+datas += collect_data_files('jieba')
+datas += collect_data_files('lxml')
+datas += collect_data_files('werkzeug')
+
+
+datas += [("gemini_translator/config/translation_qa_prompts.json", "gemini_translator/config")]
+
+a = Analysis(
+    ['main.py'],
+    pathex=[],
+    binaries=[],
+    datas=datas,
+    hiddenimports=[
+        'PyQt6.sip',
+        'docx',
+        'pypdf',
+        'playwright.sync_api',
+        'google.genai',
+        'google.genai.types',
+        *LAZY_HANDLER_HIDDEN_IMPORTS,
+        *LAZY_SERVER_HIDDEN_IMPORTS,
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='translatorFork-full',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=['gemini_translator\\GT.ico'],
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='translatorFork-full',
+)

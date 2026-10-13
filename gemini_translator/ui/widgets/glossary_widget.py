@@ -1,0 +1,1561 @@
+# gemini_translator/ui/widgets/glossary_widget.py
+
+import json
+import os
+
+import re
+import traceback
+import zipfile
+import time
+
+from PyQt6 import QtWidgets
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
+    QHeaderView, QFileDialog, QMessageBox, QDialog, QDialogButtonBox, QGroupBox,
+    QRadioButton, QFrame, QSizePolicy, QAbstractItemView, QLabel, QCheckBox
+)
+from PyQt6.QtCore import pyqtSignal, Qt, pyqtSlot, QTimer
+
+from ..dialogs.glossary import (
+    GlossaryManagerPage,
+    ImporterWizardDialog,
+    MainWindow as GlossaryToolWindow,
+    MultiImportManagerDialog,
+)
+from ..dialogs.glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
+from .ancestor_utils import find_ancestor_by_class_name
+from ...utils.settings import SettingsManager
+from ...api import config as api_config
+from collections import defaultdict
+from ..overlay_host import exec_dialog
+
+
+PROJECT_GLOSSARY_FILENAME = "project_glossary.json"
+PROJECT_GLOSSARY_AUTOSAVE_FILENAME = "project_glossary.autosave.json"
+PROJECT_GLOSSARY_STATE_FILENAME = "project_glossary_state.json"
+GLOSSARY_TABLE_ROW_HEIGHT = 36
+GLOSSARY_PAGE_SIZE = 500
+
+
+def sorted_glossary_entries(entries: list[dict]) -> list[dict]:
+    """Стабильно сортирует записи по original, оставляя пустые строки в конце."""
+    def sort_key(entry):
+        original = str(entry.get("original", "") or "").strip()
+        return not original, original.casefold()
+
+    return sorted(
+        entries,
+        key=sort_key,
+    )
+
+
+def normalize_glossary_field(value) -> str:
+    return "" if value is None else str(value)
+
+
+def glossary_snapshot(entries) -> list[dict]:
+    raw_list = []
+    if isinstance(entries, dict):
+        raw_list = [
+            {"original": key, **(value if isinstance(value, dict) else {"rus": value})}
+            for key, value in entries.items()
+        ]
+    elif isinstance(entries, list):
+        raw_list = entries
+
+    snapshot = []
+    for entry in raw_list:
+        if not isinstance(entry, dict):
+            continue
+        snapshot.append(
+            {
+                "original": str(entry.get("original", "") or ""),
+                "rus": str(entry.get("rus") or entry.get("translation") or ""),
+                "note": str(entry.get("note", "") or ""),
+                "timestamp": entry.get("timestamp"),
+            }
+        )
+    return snapshot
+
+
+def glossary_entry_key(entry) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return str(entry.get("original", "") or "").strip().casefold()
+
+
+def normalize_imported_glossary_entry(entry) -> dict | None:
+    if not isinstance(entry, dict):
+        return None
+
+    clean_entry = entry.copy()
+    if not clean_entry.get("rus") and clean_entry.get("translation"):
+        clean_entry["rus"] = clean_entry.get("translation")
+
+    clean_entry["original"] = normalize_glossary_field(clean_entry.get("original"))
+    clean_entry["rus"] = normalize_glossary_field(clean_entry.get("rus"))
+    clean_entry["note"] = normalize_glossary_field(clean_entry.get("note"))
+    if "translation" in clean_entry:
+        clean_entry["translation"] = normalize_glossary_field(clean_entry.get("translation"))
+    if clean_entry.get("timestamp") is None:
+        clean_entry.pop("timestamp", None)
+
+    if not any(
+        clean_entry.get(field, "").strip()
+        for field in ("original", "rus", "note")
+    ):
+        return None
+    return clean_entry
+
+
+def merge_imported_glossary_entries(existing_entries, imported_entries) -> list[dict]:
+    merged_entries: list[dict] = []
+    key_to_index: dict[str, int] = {}
+
+    def add_entries(entries, *, update_existing: bool):
+        for entry in entries or []:
+            clean_entry = normalize_imported_glossary_entry(entry)
+            if clean_entry is None:
+                continue
+
+            key = glossary_entry_key(clean_entry)
+            if not key:
+                merged_entries.append(clean_entry)
+                continue
+
+            existing_index = key_to_index.get(key)
+            if existing_index is None:
+                key_to_index[key] = len(merged_entries)
+                merged_entries.append(clean_entry)
+                continue
+
+            if update_existing:
+                previous_timestamp = merged_entries[existing_index].get("timestamp")
+                merged_entries[existing_index].update(clean_entry)
+                if previous_timestamp and "timestamp" not in clean_entry:
+                    merged_entries[existing_index]["timestamp"] = previous_timestamp
+
+    add_entries(existing_entries, update_existing=False)
+    add_entries(imported_entries, update_existing=True)
+    return merged_entries
+
+
+class GeneratedTermsReviewDialog(QDialog):
+    """Editable review list for AI-generated terms before they enter the project glossary."""
+
+    def __init__(self, new_entries: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Новые термины AI")
+        self.resize(820, 520)
+        self._new_entries = [entry.copy() for entry in new_entries if isinstance(entry, dict)]
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        header_layout = QHBoxLayout()
+        icon_label = QLabel()
+        icon = QApplication.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogListView)
+        icon_label.setPixmap(icon.pixmap(28, 28))
+        header_layout.addWidget(icon_label)
+
+        title = QLabel(
+            f"<b>Новые термины: {len(self._new_entries)}</b><br>"
+            "Проверьте список, отредактируйте перевод или снимите галочку с лишних строк."
+        )
+        title.setWordWrap(True)
+        header_layout.addWidget(title, 1)
+        layout.addLayout(header_layout)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setAlternatingRowColors(True)
+        self.table.setHorizontalHeaderLabels(["Добавить", "Оригинал", "Перевод", "Примечание"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.table.setWordWrap(True)
+        self.table.verticalHeader().setDefaultSectionSize(GLOSSARY_TABLE_ROW_HEIGHT)
+        self.table.verticalHeader().setMinimumSectionSize(GLOSSARY_TABLE_ROW_HEIGHT)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+
+        self.table.setRowCount(len(self._new_entries))
+        for row, entry in enumerate(self._new_entries):
+            include_item = QTableWidgetItem()
+            include_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            include_item.setCheckState(Qt.CheckState.Checked)
+            self.table.setItem(row, 0, include_item)
+
+            original_item = QTableWidgetItem(normalize_glossary_field(entry.get("original")))
+            translation_item = QTableWidgetItem(
+                normalize_glossary_field(entry.get("rus") or entry.get("translation"))
+            )
+            note_item = QTableWidgetItem(normalize_glossary_field(entry.get("note")))
+            self.table.setItem(row, 1, original_item)
+            self.table.setItem(row, 2, translation_item)
+            self.table.setItem(row, 3, note_item)
+
+        layout.addWidget(self.table, 1)
+
+        actions = QHBoxLayout()
+        select_all_btn = QPushButton("Выбрать все")
+        select_all_btn.clicked.connect(lambda: self._set_all_checked(True))
+        clear_all_btn = QPushButton("Снять все")
+        clear_all_btn.clicked.connect(lambda: self._set_all_checked(False))
+        actions.addWidget(select_all_btn)
+        actions.addWidget(clear_all_btn)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.button_box = QDialogButtonBox()
+        apply_button = self.button_box.addButton("Применить выбранные", QDialogButtonBox.ButtonRole.AcceptRole)
+        apply_button.setDefault(True)
+        cancel_button = self.button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
+        cancel_button.setText("Отмена")
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def _set_all_checked(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(state)
+
+    def accept(self):
+        current = self.table.currentItem()
+        if current:
+            self.table.closePersistentEditor(current)
+        self.table.setFocus()
+        super().accept()
+
+    def reviewed_entries(self) -> list[dict]:
+        reviewed = []
+        seen_keys = set()
+        for row in range(self.table.rowCount()):
+            include_item = self.table.item(row, 0)
+            if not include_item or include_item.checkState() != Qt.CheckState.Checked:
+                continue
+
+            original = self.table.item(row, 1).text().strip() if self.table.item(row, 1) else ""
+            rus = self.table.item(row, 2).text().strip() if self.table.item(row, 2) else ""
+            note = self.table.item(row, 3).text().strip() if self.table.item(row, 3) else ""
+            if not original:
+                continue
+
+            key = original.casefold()
+            if key in seen_keys:
+                continue
+
+            source = self._new_entries[row].copy() if row < len(self._new_entries) else {}
+            source["original"] = original
+            source["rus"] = rus
+            source["note"] = note
+            if "timestamp" not in source:
+                source["timestamp"] = time.time()
+            reviewed.append(source)
+            seen_keys.add(key)
+        return reviewed
+
+
+class GlossaryWidget(QWidget):
+    """
+    Виджет для управления глоссарием проекта, включая таблицу и кнопки управления.
+    Версия 2.0: Встроенная пагинация.
+    """
+    glossary_changed = pyqtSignal()
+
+    def __init__(self, parent=None, settings_manager: SettingsManager = None):
+        super().__init__(parent)
+        self.settings_manager = settings_manager
+        self.current_epub_path = None
+        self.project_path = None
+        self._saved_glossary_snapshot = []
+        # --- АТРИБУТЫ ДЛЯ ЕДИНОГО ВЕРТИКАЛЬНОГО СПИСКА ---
+        self._full_glossary_data = []
+        self.items_per_page = GLOSSARY_PAGE_SIZE
+        self.current_page = 0
+        self.total_items = 0
+        
+        # --- КОНЕЦ АТРИБУТОВ ---
+
+        self._init_ui()
+        self.table.itemChanged.connect(self._on_item_changed)
+        self.glossary_changed.connect(self._handle_glossary_changed)
+
+    def _init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.table = QTableWidget()
+        self.table.setAlternatingRowColors(True)
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Оригинал", "Перевод", "Примечание (Контекст)"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+
+        # --- НАЧАЛО ОПЕРАЦИИ ---
+        # 1. Устанавливаем быструю, фиксированную высоту по умолчанию.
+        self.table.verticalHeader().setDefaultSectionSize(GLOSSARY_TABLE_ROW_HEIGHT)
+        self.table.verticalHeader().setMinimumSectionSize(GLOSSARY_TABLE_ROW_HEIGHT)
+        
+        # 2. Подключаем "умный" делегат, который будет расширять ячейки ТОЛЬКО при редактировании.
+        delegate = ExpandingTextEditDelegate(self.table)
+        self.table.setItemDelegate(delegate)
+        # --- КОНЕЦ ОПЕРАЦИИ ---
+
+        self.table.setWordWrap(True)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        main_layout.addWidget(self.table)
+
+        # --- ПАНЕЛЬ ПАГИНАЦИИ ---
+        pagination_widget = QWidget()
+        self.pagination_widget = pagination_widget
+        pagination_layout = QHBoxLayout(pagination_widget)
+        pagination_layout.setContentsMargins(0, 5, 0, 5)
+        self.first_page_button = QPushButton("<< В начало")
+        self.first_page_button.clicked.connect(self._go_to_first_page)
+        self.prev_page_button = QPushButton("< Назад")
+        self.prev_page_button.clicked.connect(self._go_to_prev_page)
+        self.page_info_label = QLabel("Страница 1 / 1")
+        self.page_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.next_page_button = QPushButton("Вперед >")
+        self.next_page_button.clicked.connect(self._go_to_next_page)
+        self.last_page_button = QPushButton("В конец >>")
+        self.last_page_button.clicked.connect(self._go_to_last_page)
+        pagination_layout.addStretch()
+        pagination_layout.addWidget(self.first_page_button)
+        pagination_layout.addWidget(self.prev_page_button)
+        pagination_layout.addWidget(self.page_info_label)
+        pagination_layout.addWidget(self.next_page_button)
+        pagination_layout.addWidget(self.last_page_button)
+        pagination_layout.addStretch()
+        pagination_widget.setVisible(False)
+        main_layout.addWidget(pagination_widget)
+        # --- КОНЕЦ ПАНЕЛИ ПАГИНАЦИИ ---
+
+        bottom_panel = QWidget()
+        bottom_panel_layout = QHBoxLayout(bottom_panel)
+        bottom_panel_layout.setContentsMargins(0, 5, 0, 5)
+
+        table_actions_layout = QHBoxLayout()
+        self.add_row_btn = QPushButton("➕ Добавить")
+        self.add_row_btn.setToolTip("Добавить новый термин в таблицу")
+        self.add_row_btn.clicked.connect(self._add_row)
+        self.remove_row_btn = QPushButton("➖ Удалить")
+        self.remove_row_btn.setToolTip("Удалить выделенные строки")
+        self.remove_row_btn.clicked.connect(self._remove_selected_rows)
+        
+        # --- НОВАЯ КНОПКА (скрыта по умолчанию) ---
+        self.cleanup_btn = QPushButton("🧹 Пост-обработка")
+        self.cleanup_btn.setToolTip("Автоматически исправить скобки и слеши в переводах")
+        self.cleanup_btn.clicked.connect(self._open_cleanup_dialog)
+        self.cleanup_btn.setVisible(False) 
+        # ------------------------------------------
+
+        table_actions_layout.addWidget(self.add_row_btn)
+        table_actions_layout.addWidget(self.remove_row_btn)
+        table_actions_layout.addWidget(self.cleanup_btn) # Добавляем в лейаут
+        
+        global_actions_layout = QHBoxLayout()
+        self.project_save_btn = QPushButton("💾 Сохранить в проект")
+        self.project_save_btn.setToolTip("Сохраняет глоссарий в project_glossary.json текущего проекта.")
+        self.project_save_btn.clicked.connect(self.save_project_glossary)
+        self.project_save_btn.setVisible(False)
+        self.load_btn = QPushButton("Импорт…")
+        self.load_btn.setToolTip("Загрузить глоссарий из файла (.json, .txt)")
+        self.load_btn.clicked.connect(self._load_from_file)
+        self.manage_btn = QPushButton("🛠️ Менеджер…")
+        self.manage_btn.setToolTip("Открыть менеджер для анализа и разрешения конфликтов")
+        self.manage_btn.clicked.connect(self._open_manager)
+        self.generate_btn = QPushButton("✨ Генерация AI…")
+        self.generate_btn.setToolTip("Создать/дополнить глоссарий с помощью AI на основе выбранных глав")
+        self.generate_btn.clicked.connect(self._open_ai_generation_dialog)
+        global_actions_layout.addWidget(self.project_save_btn)
+        global_actions_layout.addWidget(self.load_btn)
+        global_actions_layout.addWidget(self.manage_btn)
+        global_actions_layout.addWidget(self.generate_btn)
+
+        bottom_panel_layout.addLayout(table_actions_layout)
+        bottom_panel_layout.addStretch()
+        bottom_panel_layout.addLayout(global_actions_layout)
+        
+        main_layout.addWidget(bottom_panel)
+
+        
+    def get_glossary(self) -> list:
+        # Теперь этот метод всегда возвращает полный список
+        return self._full_glossary_data
+
+    def set_project_path(self, project_path: str | None):
+        self.project_path = os.path.normpath(project_path) if project_path else None
+        if not self.project_path:
+            self._saved_glossary_snapshot = []
+        self._update_project_save_controls()
+
+    def _project_glossary_path(self) -> str | None:
+        if not self.project_path:
+            return None
+        return os.path.join(self.project_path, PROJECT_GLOSSARY_FILENAME)
+
+    def _project_glossary_autosave_path(self) -> str | None:
+        if not self.project_path:
+            return None
+        return os.path.join(self.project_path, PROJECT_GLOSSARY_AUTOSAVE_FILENAME)
+
+    def _project_glossary_state_path(self) -> str | None:
+        if not self.project_path:
+            return None
+        return os.path.join(self.project_path, PROJECT_GLOSSARY_STATE_FILENAME)
+
+    def _snapshot_glossary_state(self, glossary_data=None) -> list[dict]:
+        if glossary_data is None:
+            glossary_data = self.get_glossary()
+        return glossary_snapshot(glossary_data)
+
+    def _has_unsaved_project_changes(self) -> bool:
+        return self._snapshot_glossary_state() != self._saved_glossary_snapshot
+
+    def mark_current_state_as_saved(self):
+        self._saved_glossary_snapshot = self._snapshot_glossary_state()
+        self._update_project_save_controls()
+
+    def _update_project_save_controls(self):
+        if not hasattr(self, "project_save_btn"):
+            return
+
+        has_project = bool(self.project_path)
+        is_dirty = has_project and self._has_unsaved_project_changes()
+        self.project_save_btn.setVisible(has_project)
+        self.project_save_btn.setEnabled(has_project and bool(self.get_glossary() or is_dirty))
+        self.project_save_btn.setText("💾 Сохранить в проект*" if is_dirty else "💾 Сохранить в проект")
+
+    def _write_glossary_json(self, file_path: str, glossary_data) -> None:
+        with open(file_path, "w", encoding="utf-8") as handle:
+            json.dump(glossary_data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def _load_glossary_json(self, file_path: str, missing_value=None):
+        if not file_path or not os.path.exists(file_path):
+            return missing_value
+        with open(file_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def _find_setup_dialog(self):
+        return find_ancestor_by_class_name(self, "InitialSetupDialog", "InitialSetupPage")
+
+    def _sync_saved_state_to_parent(self, glossary_data):
+        parent_dialog = self._find_setup_dialog()
+        if parent_dialog and hasattr(parent_dialog, "mark_project_glossary_as_saved"):
+            parent_dialog.mark_project_glossary_as_saved(glossary_data)
+
+    def _save_project_autosave(self):
+        autosave_path = self._project_glossary_autosave_path()
+        if not autosave_path:
+            return
+        try:
+            self._write_glossary_json(
+                autosave_path,
+                [entry.copy() for entry in self.get_glossary()],
+            )
+        except Exception:
+            # Автокопия не должна ломать редактирование.
+            pass
+
+    def load_project_glossary(self) -> tuple[list[dict], bool]:
+        project_data = []
+        restored_from_autosave = False
+
+        project_path = self._project_glossary_path()
+        autosave_path = self._project_glossary_autosave_path()
+
+        if project_path and os.path.exists(project_path):
+            project_data = self._load_glossary_json(project_path, missing_value=[]) or []
+
+        autosave_data = self._load_glossary_json(autosave_path, missing_value=None)
+        glossary_to_display = project_data
+
+        if autosave_data is not None and glossary_snapshot(autosave_data) != glossary_snapshot(project_data):
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Восстановление глоссария")
+            msg_box.setIcon(QMessageBox.Icon.Question)
+            msg_box.setText("Найдена автокопия глоссария с несохранёнными изменениями.")
+            msg_box.setInformativeText("Восстановить её и продолжить работу с последними правками?")
+            restore_btn = msg_box.addButton("Восстановить", QMessageBox.ButtonRole.AcceptRole)
+            msg_box.addButton("Пропустить", QMessageBox.ButtonRole.RejectRole)
+            msg_box.setDefaultButton(restore_btn)
+            msg_box.exec()
+            if msg_box.clickedButton() == restore_btn:
+                glossary_to_display = autosave_data
+                restored_from_autosave = True
+
+        self.set_glossary(glossary_to_display, emit_signal=False)
+        if not restored_from_autosave:
+            self.mark_current_state_as_saved()
+        self.restore_project_view_state()
+        return sorted_glossary_entries(glossary_snapshot(project_data)), restored_from_autosave
+
+    def save_project_glossary(self, checked=False, notify: bool = True) -> bool:
+        del checked
+        project_glossary_path = self._project_glossary_path()
+        if not project_glossary_path:
+            return False
+
+        self.commit_active_editor()
+        glossary_to_save = [entry.copy() for entry in self.get_glossary()]
+
+        try:
+            self._write_glossary_json(project_glossary_path, glossary_to_save)
+            self._save_project_autosave()
+            self.mark_current_state_as_saved()
+            self._sync_saved_state_to_parent(glossary_to_save)
+            if notify:
+                QMessageBox.information(
+                    self,
+                    "Успех",
+                    "Глоссарий сохранён в project_glossary.json.",
+                )
+            return True
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Ошибка",
+                f"Не удалось сохранить project_glossary.json:\n{exc}",
+            )
+            return False
+
+    def _save_project_view_state(self):
+        state_path = self._project_glossary_state_path()
+        if not state_path:
+            return
+
+        state = {}
+        try:
+            if os.path.exists(state_path):
+                with open(state_path, "r", encoding="utf-8") as handle:
+                    loaded_state = json.load(handle)
+                    if isinstance(loaded_state, dict):
+                        state = loaded_state
+        except Exception:
+            state = {}
+
+        state["current_page"] = int(getattr(self, "current_page", 0) or 0)
+        try:
+            state["vertical_scroll_value"] = int(self.table.verticalScrollBar().value())
+        except Exception:
+            state["vertical_scroll_value"] = 0
+        try:
+            with open(state_path, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        except Exception:
+            pass
+
+    def restore_project_view_state(self):
+        state_path = self._project_glossary_state_path()
+        if not state_path or not os.path.exists(state_path):
+            return
+
+        try:
+            with open(state_path, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except Exception:
+            return
+
+        try:
+            scroll_value = int((state or {}).get("vertical_scroll_value", 0))
+        except (TypeError, ValueError):
+            scroll_value = 0
+
+        try:
+            saved_page = int((state or {}).get("current_page", 0))
+        except (TypeError, ValueError):
+            saved_page = 0
+
+        if saved_page > 0 and self.total_pages > 1:
+            self.current_page = max(0, min(saved_page, self.total_pages - 1))
+            self._load_current_page()
+
+        QTimer.singleShot(0, lambda value=scroll_value: self.table.verticalScrollBar().setValue(value))
+
+    def _handle_glossary_changed(self):
+        self._update_project_save_controls()
+        self._save_project_view_state()
+        self._save_project_autosave()
+
+    def _sort_full_glossary_data(self):
+        self._full_glossary_data = sorted_glossary_entries(self._full_glossary_data)
+
+    def _page_start_index(self) -> int:
+        return max(0, int(self.current_page or 0) * max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE)))
+
+    def _coerce_current_page(self):
+        self.total_items = len(self._full_glossary_data)
+        self.current_page = max(0, min(int(self.current_page or 0), self.total_pages - 1))
+
+    def _find_entry_index(self, target_entry) -> int | None:
+        for index, entry in enumerate(self._full_glossary_data):
+            if entry is target_entry:
+                return index
+        return None
+
+    def set_glossary(self, glossary_data, emit_signal: bool = True):
+        self.table.blockSignals(True)
+        entries_to_load = []
+        
+        # --- Нормализация данных (rus vs translation + timestamp) ---
+        raw_list = []
+        if isinstance(glossary_data, dict):
+            raw_list = [
+                {"original": k, **(v if isinstance(v, dict) else {"rus": v})}
+                for k, v in glossary_data.items()
+            ]
+        elif isinstance(glossary_data, list):
+            raw_list = glossary_data
+            
+        current_now = time.time()
+
+        for entry in raw_list:
+            if not isinstance(entry, dict):
+                continue
+            clean_entry = entry.copy()
+            
+            # Фолбэк: если нет 'rus', но есть 'translation', используем его
+            if 'rus' not in clean_entry and 'translation' in clean_entry:
+                clean_entry['rus'] = clean_entry['translation']
+            
+            # Гарантируем наличие ключей
+            if 'rus' not in clean_entry: clean_entry['rus'] = ""
+            if 'note' not in clean_entry: clean_entry['note'] = ""
+            if 'original' not in clean_entry: clean_entry['original'] = ""
+            clean_entry['original'] = normalize_glossary_field(clean_entry.get('original'))
+            clean_entry['rus'] = normalize_glossary_field(clean_entry.get('rus'))
+            clean_entry['note'] = normalize_glossary_field(clean_entry.get('note'))
+            if 'translation' in clean_entry:
+                clean_entry['translation'] = normalize_glossary_field(clean_entry.get('translation'))
+            
+            # ТАЙМСТАМП: Сохраняем старый или создаем новый (для импорта из старых версий)
+            if 'timestamp' not in clean_entry:
+                clean_entry['timestamp'] = current_now
+            
+            entries_to_load.append(clean_entry)
+
+        self._full_glossary_data = sorted_glossary_entries(entries_to_load)
+        self.current_page = 0
+        self._load_current_page()
+        self._update_project_save_controls()
+        
+        self.table.blockSignals(False)
+        if emit_signal:
+            self.glossary_changed.emit()
+
+    def _add_row(self):
+        """Создает новую запись в глоссарии с текущей меткой времени и открывает её для редактирования."""
+        # Создаем запись с таймстампом (дата создания)
+        new_entry = {
+            "original": "", 
+            "rus": "", 
+            "note": "", 
+            "timestamp": time.time()
+        }
+        
+        # Вставляем в начало текущей страницы для визуального удобства
+        start_index = self._page_start_index()
+        self._full_glossary_data.insert(start_index, new_entry)
+        
+        # Перезагружаем таблицу, чтобы увидеть новую пустую строку
+        self._load_current_page()
+        
+        # Автоматически переходим в режим редактирования первой ячейки новой строки
+        QTimer.singleShot(0, lambda: (
+            self.table.selectRow(0),
+            self.table.scrollToItem(self.table.item(0, 0)),
+            self.table.editItem(self.table.item(0, 0))
+        ))
+        
+        self.glossary_changed.emit()
+
+    def _remove_selected_rows(self):
+        selected_rows_on_page = sorted(list(set(index.row() for index in self.table.selectedIndexes())), reverse=True)
+        if not selected_rows_on_page: return
+
+        start_index = self._page_start_index()
+        
+        self.table.blockSignals(True)
+        # Удаляем из полного списка по реальным индексам
+        for row_on_page in selected_rows_on_page:
+            index_in_full_list = start_index + row_on_page
+            if 0 <= index_in_full_list < len(self._full_glossary_data):
+                del self._full_glossary_data[index_in_full_list]
+        
+        # Перезагружаем текущую страницу
+        self._coerce_current_page()
+        self._load_current_page()
+        self.table.blockSignals(False)
+        self.glossary_changed.emit()
+
+    @pyqtSlot(QtWidgets.QTableWidgetItem)
+    def _on_item_changed(self, item: QtWidgets.QTableWidgetItem):
+        """
+        Синхронизирует ИЗМЕНЕННУЮ ячейку с полным списком в памяти,
+        используя сохраненный индекс для надежности при сортировке.
+        """
+        if self.table.signalsBlocked():
+            return
+
+        # Получаем реальный индекс данных, который мы сохранили при загрузке
+        index_in_full_list = item.data(Qt.ItemDataRole.UserRole)
+        
+        # Если индекса нет (например, новая строка до перезагрузки) или он некорректен
+        if index_in_full_list is None:
+            # Fallback на старую логику только для крайних случаев
+            row = item.row()
+            index_in_full_list = row
+
+        col = item.column()
+
+        # Проверяем, что индекс в пределах допустимого
+        if 0 <= index_in_full_list < len(self._full_glossary_data):
+            entry = self._full_glossary_data[index_in_full_list]
+            
+            text_value = item.text().strip()
+            
+            if col == 0:
+                entry["original"] = text_value
+            elif col == 1:
+                entry["rus"] = text_value
+            elif col == 2:
+                entry["note"] = text_value
+
+            if col == 0:
+                self._sort_full_glossary_data()
+                new_index = self._find_entry_index(entry)
+                if new_index is not None:
+                    self.current_page = new_index // max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE))
+                    self._load_current_page()
+                    new_row = new_index - self._page_start_index()
+                    if 0 <= new_row < self.table.rowCount():
+                        self.table.selectRow(new_row)
+                        target_item = self.table.item(new_row, 0)
+                        if target_item:
+                            self.table.scrollToItem(target_item)
+
+        self.glossary_changed.emit()
+        
+    def commit_active_editor(self):
+        """Принудительно завершает редактирование активной ячейки, сохраняя данные."""
+        if self.table.state() == QAbstractItemView.State.EditingState:
+            # Смена фокуса заставляет делегат сохранить данные и закрыть редактор
+            self.table.setFocus() 
+            # На случай, если фокус уже там, явно закрываем для текущего элемента
+            current = self.table.currentItem()
+            if current:
+                self.table.closePersistentEditor(current)
+                
+    # --- МЕТОДЫ ПАГИНАЦИИ ---
+    @property
+    def total_pages(self) -> int:
+        total = len(self._full_glossary_data)
+        page_size = max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE))
+        return max(1, (total + page_size - 1) // page_size)
+
+    def _load_current_page(self):
+        self.table.blockSignals(True)
+        self.table.setSortingEnabled(False) 
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(0)
+        self.total_items = len(self._full_glossary_data)
+
+        self._coerce_current_page()
+        page_size = max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE))
+        start_index = self._page_start_index()
+        end_index = min(start_index + page_size, self.total_items)
+        
+        page_data = self._full_glossary_data[start_index:end_index] # Срез ссылок на словари
+        
+        self.table.setRowCount(len(page_data))
+        
+        for i, entry in enumerate(page_data):
+            real_data_index = start_index + i
+            
+            # Создаем элементы и привязываем к ним РЕАЛЬНЫЙ индекс в списке
+            item_original = QTableWidgetItem(entry.get("original", ""))
+            item_original.setData(Qt.ItemDataRole.UserRole, real_data_index)
+            
+            item_translation = QTableWidgetItem(entry.get("rus", ""))
+            item_translation.setData(Qt.ItemDataRole.UserRole, real_data_index)
+            
+            item_note = QTableWidgetItem(entry.get("note", ""))
+            item_note.setData(Qt.ItemDataRole.UserRole, real_data_index)
+
+            self.table.setItem(i, 0, item_original)
+            self.table.setItem(i, 1, item_translation)
+            self.table.setItem(i, 2, item_note)
+        
+        self.table.setUpdatesEnabled(True)
+        self.table.blockSignals(False)
+        self._update_pagination_controls()
+        
+    def set_cleanup_button_visible(self, visible: bool):
+        """Управляет видимостью кнопки пост-обработки."""
+        self.cleanup_btn.setVisible(visible)
+    
+    def set_epub_path(self, path: str):
+        """Устанавливает путь к текущему EPUB файлу для инструментов анализа."""
+        self.current_epub_path = path
+        
+    def _open_cleanup_dialog(self):
+        """Открывает диалог очистки/пост-обработки."""
+        if not self._full_glossary_data:
+            QMessageBox.information(self, "Пусто", "Глоссарий пуст, обрабатывать нечего.")
+            return
+
+        # Передаем сохраненный путь (self.current_epub_path)
+        dialog = GlossaryCleanupDialog(
+            self.get_glossary(), 
+            epub_path=self.current_epub_path, 
+            parent=self
+        )
+        
+        if exec_dialog(self, dialog) == QDialog.DialogCode.Accepted:
+            new_data, count = dialog.process_data()
+            if count > 0:
+                self.set_glossary(new_data)
+                QMessageBox.information(self, "Готово", f"Обработано записей: {count}")
+            else:
+                QMessageBox.information(self, "Результат", "Изменений не потребовалось.")
+        
+    def _update_pagination_controls(self):
+        total_pg = self.total_pages
+        current_pg = self.current_page + 1
+        self.page_info_label.setText(f"Страница {current_pg} / {total_pg} · Всего: {self.total_items}")
+        is_not_first = self.current_page > 0
+        self.first_page_button.setEnabled(is_not_first)
+        self.prev_page_button.setEnabled(is_not_first)
+        is_not_last = self.current_page < total_pg - 1
+        self.next_page_button.setEnabled(is_not_last)
+        self.last_page_button.setEnabled(is_not_last)
+        self.pagination_widget.setVisible(self.total_items > max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE)))
+
+    def _go_to_first_page(self):
+        self.commit_active_editor()
+        self.current_page = 0
+        self._save_project_view_state()
+        # Разрываем стек вызовов. _load_current_page будет вызван из "чистого" состояния.
+        QTimer.singleShot(0, self._load_current_page)
+
+    def _go_to_prev_page(self):
+        self.commit_active_editor()
+        self.current_page = max(0, self.current_page - 1)
+        self._save_project_view_state()
+        # Разрываем стек вызовов.
+        QTimer.singleShot(0, self._load_current_page)
+
+    def _go_to_next_page(self):
+        self.commit_active_editor()
+        self.current_page = min(self.total_pages - 1, self.current_page + 1)
+        self._save_project_view_state()
+        # Разрываем стек вызовов.
+        QTimer.singleShot(0, self._load_current_page)
+
+    def _go_to_last_page(self):
+        self.commit_active_editor()
+        self.current_page = self.total_pages - 1
+        self._save_project_view_state()
+        QTimer.singleShot(0, self._load_current_page)
+        
+    # --- Остальные методы (без изменений) ---
+    def set_simplified_mode(self):
+        self.load_btn.hide()
+        self.manage_btn.hide()
+        self.generate_btn.hide()
+        
+    def set_generation_enabled(self, enabled):
+        self.generate_btn.setEnabled(enabled)
+        
+    def clear(self):
+        self.set_glossary([])
+
+    def _try_parse_standard_json_file(self, path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if not content.strip():
+                return []
+
+            data = json.loads(content)
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                first_item_keys = data[0].keys()
+                has_translation = 'rus' in first_item_keys or 'translation' in first_item_keys
+                if 'original' in first_item_keys and has_translation:
+                    return data
+
+            if isinstance(data, dict) and data:
+                first_key = next(iter(data), None)
+                if first_key and isinstance(data[first_key], dict):
+                    first_item_keys = data[first_key].keys()
+                    has_translation = 'rus' in first_item_keys or 'translation' in first_item_keys
+                    if has_translation:
+                        return [
+                            {'original': term, **term_data}
+                            for term, term_data in data.items()
+                        ]
+
+            return None
+        except Exception:
+            return None
+
+    def _load_single_import_file(self, file_path):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        if not content.strip():
+            QMessageBox.information(
+                self,
+                "Файл пуст",
+                f"Выбранный файл пуст:\n{file_path}",
+            )
+            return [], 1
+
+        wizard = ImporterWizardDialog(initial_data=content, parent=self)
+        if exec_dialog(self, wizard) == QDialog.DialogCode.Accepted:
+            return wizard.get_glossary(), 1
+        return [], 0
+
+    def _load_from_file(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Загрузить глоссарии из файлов",
+            "",
+            "Все поддерживаемые (*.json *.txt);;JSON Files (*.json);;Text Files (*.txt)",
+        )
+        if not file_paths:
+            return
+
+        try:
+            imported_entries, files_processed_count = [], 0
+
+            if len(file_paths) == 1:
+                imported_entries, files_processed_count = self._load_single_import_file(file_paths[0])
+            else:
+                pre_processed, to_configure = {}, []
+                for file_path in file_paths:
+                    parsed_data = self._try_parse_standard_json_file(file_path)
+                    if parsed_data is not None:
+                        pre_processed[file_path] = parsed_data
+                    else:
+                        to_configure.append(file_path)
+
+                if to_configure:
+                    manager = MultiImportManagerDialog(to_configure, pre_processed, self)
+                    if exec_dialog(self, manager) != QDialog.DialogCode.Accepted:
+                        return
+                    imported_entries, files_processed_count = manager.get_all_imported_entries()
+                else:
+                    for parsed_entries in pre_processed.values():
+                        imported_entries.extend(parsed_entries)
+                    files_processed_count = len(pre_processed)
+
+            if not imported_entries:
+                if files_processed_count > 0:
+                    QMessageBox.information(
+                        self,
+                        "Нет данных",
+                        "Импорт завершен, но не удалось извлечь ни одной записи.",
+                    )
+                return
+
+            previous_count = len(self.get_glossary())
+            merged_glossary = merge_imported_glossary_entries(self.get_glossary(), imported_entries)
+            self.set_glossary(merged_glossary)
+            delta = len(merged_glossary) - previous_count
+            QMessageBox.information(
+                self,
+                "Успех",
+                (
+                    f"Импортировано {len(imported_entries)} записей из "
+                    f"{files_processed_count} файл(ов).\n"
+                    f"В глоссарии теперь {len(merged_glossary)} записей "
+                    f"({delta:+d})."
+                ),
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Ошибка загрузки",
+                f"Не удалось прочитать или обработать файл: {e}",
+            )
+        return
+            
+    def _open_manager(self):
+        # Ищем страницу/диалог настроек, чтобы взять путь проекта и выбрать способ открытия.
+        parent_dialog = find_ancestor_by_class_name(self, 'InitialSetupDialog', 'InitialSetupPage')
+        
+        # --- ИЗВЛЕЧЕНИЕ ПУТИ ПРОЕКТА ---
+        project_folder = None
+        if parent_dialog and hasattr(parent_dialog, 'output_folder'):
+            project_folder = parent_dialog.output_folder
+        # -------------------------------
+
+        if parent_dialog and hasattr(parent_dialog, 'request_push'):
+            manager_page = GlossaryManagerPage(mode='dialog', project_path=project_folder)
+            manager_page.set_glossary(self.get_glossary())
+            manager_page.mark_current_state_as_saved()
+
+            def apply_manager_result(accepted, page=manager_page):
+                is_project_synced = False
+                if accepted:
+                    updated_glossary = page.get_glossary()
+                    is_project_synced = page.is_current_state_saved_to_project()
+                    self.set_glossary(updated_glossary, emit_signal=not is_project_synced)
+                    if is_project_synced:
+                        self.mark_current_state_as_saved()
+                        self._sync_saved_state_to_parent(updated_glossary)
+
+                # Страница уже обработала accept/reject; shell может закрыть её
+                # без повторного вопроса про несохраненные изменения.
+                page.mark_current_state_as_saved(saved_to_project=is_project_synced)
+                page.request_back.emit()
+
+            manager_page.result_ready.connect(apply_manager_result)
+            parent_dialog.request_push.emit(manager_page)
+            return
+
+        if parent_dialog:
+            parent_dialog.setEnabled(False)
+            parent_dialog.is_blocked_by_child_dialog = True
+        
+        # --- ПЕРЕДАЕМ project_path В КОНСТРУКТОР ---
+        manager_window = GlossaryToolWindow(self, mode='dialog', project_path=project_folder)
+        
+        manager_window.set_glossary(self.get_glossary())
+        manager_window.mark_current_state_as_saved()
+        if manager_window.exec() == QDialog.DialogCode.Accepted:
+            updated_glossary = manager_window.get_glossary()
+            is_project_synced = manager_window.is_current_state_saved_to_project()
+            self.set_glossary(updated_glossary, emit_signal=not is_project_synced)
+            if is_project_synced:
+                self.mark_current_state_as_saved()
+                self._sync_saved_state_to_parent(updated_glossary)
+        
+        if parent_dialog:
+            parent_dialog.setEnabled(True)
+            parent_dialog.is_blocked_by_child_dialog = False
+            parent_dialog._check_and_sync_active_session()
+            
+    def _report_glossary_error(self, context: str, error: Exception) -> None:
+        details = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+        print(f"[GLOSSARY-ERROR] {context}: {details}")
+        box = QMessageBox(self)
+        box.setWindowTitle("Ошибка глоссария")
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setText(context)
+        box.setInformativeText(f"{type(error).__name__}: {error}")
+        box.setDetailedText(details)
+        box.addButton("Закрыть", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+    def _open_ai_generation_dialog(self):
+        try:
+            self._open_ai_generation_dialog_impl()
+        except Exception as error:
+            self._report_glossary_error(
+                "Не удалось открыть генерацию глоссария.", error
+            )
+
+    def _open_ai_generation_dialog_impl(self):
+        from ..dialogs.glossary_dialogs.ai_generation import GenerationSessionDialog, GenerationSessionPage
+        
+        # Ищем наше главное окно InitialSetupDialog/InitialSetupPage, поднимаясь по иерархии
+        parent_dialog = find_ancestor_by_class_name(self, 'InitialSetupDialog', 'InitialSetupPage')
+        
+        if not parent_dialog:
+            QMessageBox.warning(self, "Ошибка", "Не удалось найти основное окно настроек (InitialSetupDialog).")
+            return
+
+        if not parent_dialog.html_files or not parent_dialog.selected_file:
+            QMessageBox.warning(self, "Нет данных", "Сначала выберите EPUB файл и главы в основном окне.")
+            return
+            
+        def refresh_parent_after_generation():
+            parent_dialog._check_and_sync_active_session()
+            parent_dialog._prepare_and_display_tasks(clean_rebuild=True)
+            if hasattr(parent_dialog, 'auto_translate_widget'):
+                parent_dialog.auto_translate_widget.refresh_glossary_presets()
+
+        if hasattr(parent_dialog, 'request_push'):
+            page = GenerationSessionPage(
+                settings_manager=self.settings_manager,
+                initial_glossary=self.get_glossary(),
+                merge_mode=None,
+                html_files=parent_dialog.html_files,
+                epub_path=parent_dialog.selected_file,
+                project_manager=parent_dialog.project_manager,
+                initial_ui_settings=parent_dialog.get_settings()
+            )
+            page.generation_finished.connect(self._on_generation_dialog_finished)
+
+            def finish_generation_page(_accepted, page=page):
+                refresh_parent_after_generation()
+                page.request_back.emit()
+
+            page.result_ready.connect(finish_generation_page)
+            parent_dialog.request_push.emit(page)
+            return
+
+        dialog = GenerationSessionDialog(
+            settings_manager=self.settings_manager,
+            initial_glossary=self.get_glossary(),
+            merge_mode=None,
+            html_files=parent_dialog.html_files,
+            epub_path=parent_dialog.selected_file,
+            project_manager=parent_dialog.project_manager,
+            initial_ui_settings=parent_dialog.get_settings()
+        )
+        dialog.generation_finished.connect(self._on_generation_dialog_finished)
+
+        try:
+            parent_dialog.setEnabled(False)
+            parent_dialog.is_blocked_by_child_dialog = True
+            exec_dialog(self, dialog)
+        finally:
+            parent_dialog.setEnabled(True)
+            parent_dialog.is_blocked_by_child_dialog = False
+            refresh_parent_after_generation()
+    
+    def _merge_reviewed_new_entries(self, generated_glossary, original_new_keys, reviewed_entries):
+        merged_glossary = []
+        key_to_index = {}
+
+        for entry in generated_glossary:
+            key = glossary_entry_key(entry)
+            if key in original_new_keys:
+                continue
+            clean_entry = entry.copy() if isinstance(entry, dict) else {}
+            if key:
+                key_to_index[key] = len(merged_glossary)
+            merged_glossary.append(clean_entry)
+
+        for entry in reviewed_entries:
+            if not isinstance(entry, dict):
+                continue
+            key = glossary_entry_key(entry)
+            if not key:
+                continue
+
+            clean_entry = entry.copy()
+            if "timestamp" not in clean_entry:
+                clean_entry["timestamp"] = time.time()
+
+            existing_index = key_to_index.get(key)
+            if existing_index is not None:
+                merged_glossary[existing_index].update(clean_entry)
+            else:
+                key_to_index[key] = len(merged_glossary)
+                merged_glossary.append(clean_entry)
+
+        return merged_glossary
+
+    @pyqtSlot(list, set)
+    def _on_generation_dialog_finished(self, final_glossary_from_ai, updated_generated_chapters_map):
+        if final_glossary_from_ai is None: return 
+        glossary_before = self.get_glossary()
+        before_dict = {glossary_entry_key(term): term for term in glossary_before if glossary_entry_key(term)}
+        after_dict = {glossary_entry_key(term): term for term in final_glossary_from_ai if glossary_entry_key(term)}
+        before_keys, after_keys = set(before_dict.keys()), set(after_dict.keys())
+        new_keys = after_keys - before_keys
+        final_glossary_to_apply = final_glossary_from_ai
+
+        if new_keys:
+            new_entries = [
+                term.copy()
+                for term in final_glossary_from_ai
+                if glossary_entry_key(term) in new_keys
+            ]
+            review_dialog = GeneratedTermsReviewDialog(new_entries, self)
+            if exec_dialog(self, review_dialog) != QDialog.DialogCode.Accepted:
+                return
+            final_glossary_to_apply = self._merge_reviewed_new_entries(
+                final_glossary_from_ai,
+                new_keys,
+                review_dialog.reviewed_entries(),
+            )
+            after_dict = {glossary_entry_key(term): term for term in final_glossary_to_apply if glossary_entry_key(term)}
+            after_keys = set(after_dict.keys())
+
+        added_count, deleted_count, changed_count = len(after_keys - before_keys), len(before_keys - after_keys), 0
+        common_keys = before_keys & after_keys
+        for key in common_keys:
+            if before_dict[key] != after_dict[key]:
+                changed_count += 1
+        total_changes = added_count + deleted_count + changed_count
+        self.set_glossary(final_glossary_to_apply)
+        if total_changes == 0: return
+        summary_parts = []
+        if added_count > 0: summary_parts.append(f"<b>Добавлено: {added_count}</b>")
+        if changed_count > 0: summary_parts.append(f"Изменено: {changed_count}")
+        if deleted_count > 0: summary_parts.append(f"Удалено: {deleted_count}")
+        summary_text = ", ".join(summary_parts)
+        parent_dialog = find_ancestor_by_class_name(self, 'InitialSetupDialog', 'InitialSetupPage')
+        project_folder = getattr(parent_dialog, 'output_folder', None) if parent_dialog else None
+        msg_box = QMessageBox(self); msg_box.setWindowTitle("Генерация завершена")
+        msg_box.setText(f"Обнаружены изменения в глоссарии: {summary_text}.")
+        if project_folder:
+            msg_box.setInformativeText("Хотите сохранить этот результат в файл 'project_glossary.json'?")
+            save_btn = msg_box.addButton("Сохранить в проект", QMessageBox.ButtonRole.AcceptRole)
+            discard_btn = msg_box.addButton("Не сохранять", QMessageBox.ButtonRole.RejectRole)
+            msg_box.setDefaultButton(save_btn)
+        else:
+            msg_box.setInformativeText("Данные обновлены в таблице. Папка проекта не выбрана, поэтому автосохранение недоступно.")
+            msg_box.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+        msg_box.exec()
+        if project_folder and msg_box.clickedButton() == save_btn:
+            try:
+                project_glossary_path = os.path.join(project_folder, "project_glossary.json")
+                with open(project_glossary_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.get_glossary(), f, ensure_ascii=False, indent=2, sort_keys=True)
+                if parent_dialog and hasattr(parent_dialog, 'project_manager') and parent_dialog.project_manager:
+                    parent_dialog.project_manager.save_glossary_generation_map(updated_generated_chapters_map)
+                # --- ИСПРАВЛЕНИЕ: Сохраняем копию состояния, чтобы разорвать ссылочную связь ---
+                if parent_dialog: 
+                    parent_dialog.initial_glossary_state = [item.copy() for item in self.get_glossary()]
+                QMessageBox.information(self, "Успех", "Глоссарий проекта и карта сгенерированных глав успешно сохранены.")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка сохранения", f"Не удалось сохранить глоссарий и/или карту глав: {e}")
+        
+    def set_controls_enabled(self, enabled: bool):
+        self.add_row_btn.setEnabled(enabled)
+        self.remove_row_btn.setEnabled(enabled)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed if enabled else QAbstractItemView.EditTrigger.NoEditTriggers)
+
+    def set_session_mode(self, is_session_active):
+        """Переводит виджет в режим активной сессии (блокирует элементы управления)."""
+        from PyQt6.QtWidgets import QPushButton, QLineEdit, QComboBox, QAbstractItemView
+        
+        for widget in self.findChildren(QPushButton):
+            if widget in (getattr(self, 'first_page_button', None), getattr(self, 'prev_page_button', None), 
+                          getattr(self, 'next_page_button', None), getattr(self, 'last_page_button', None)):
+                continue
+            widget.setEnabled(not is_session_active)
+            
+        for widget in self.findChildren(QLineEdit):
+            widget.setEnabled(not is_session_active)
+        for widget in self.findChildren(QComboBox):
+            widget.setEnabled(not is_session_active)
+            
+        if hasattr(self, 'table'):
+            if is_session_active:
+                if not hasattr(self, '_original_edit_triggers'):
+                    self._original_edit_triggers = self.table.editTriggers()
+                self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            else:
+                if hasattr(self, '_original_edit_triggers'):
+                    self.table.setEditTriggers(self._original_edit_triggers)
+        
+
+class GlossaryCleanupDialog(QDialog):
+    """
+    Диалог пост-обработки.
+    Режим: Анализ -> Выбор -> Применение.
+    Идентификация записей происходит по паре (original, rus), а не по индексам.
+    """
+    def __init__(self, glossary_data: list, epub_path: str = None, parent=None):
+        super().__init__(parent)
+        self.glossary_data = glossary_data 
+        self.epub_path = epub_path
+        
+        # Храним наборы кортежей: (original, rus)
+        self.candidates_parens = set()
+        self.candidates_slashes = set()
+        self.candidates_headers = set()
+        
+        self.setWindowTitle("Мастер очистки глоссария")
+        self.resize(600, 420)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # --- Описание ---
+        info_box = QLabel(
+            "Этот инструмент проанализирует глоссарий на наличие 'мусора' и структурных ошибок.\n"
+            "Нажмите 'Анализировать', чтобы увидеть статистику."
+        )
+        info_box.setStyleSheet("background-color: #2b2b2b; padding: 10px; border-radius: 5px;")
+        info_box.setWordWrap(True)
+        layout.addWidget(info_box)
+
+        # --- Чекбоксы (Изначально отключены) ---
+        self.group = QGroupBox("Результаты анализа")
+        group_layout = QVBoxLayout(self.group)
+
+        self.check_parens = QCheckBox("Перенести скобки (...) в примечание")
+        self.check_parens.setToolTip("Переносит пояснения в скобках из перевода в колонку Note.")
+        self.check_parens.setEnabled(False)
+
+        self.check_slashes = QCheckBox("Разделить варианты через слеш '/'")
+        self.check_slashes.setToolTip("Оставляет первый вариант, остальные переносит в Note как синонимы.")
+        self.check_slashes.setEnabled(False)
+
+        self.check_headers = QCheckBox("Удалить термины-заголовки")
+        self.check_headers.setToolTip(
+            "Удаляет термины, которые встречаются только как заголовки глав (h1/title)\n"
+            "и не участвуют в повествовании."
+        )
+        self.check_headers.setVisible(False)
+        self.check_headers.setEnabled(False)
+
+        group_layout.addWidget(self.check_parens)
+        group_layout.addWidget(self.check_slashes)
+        group_layout.addWidget(self.check_headers)
+        layout.addWidget(self.group)
+
+        # --- Прогресс бар ---
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        # --- Кнопки ---
+        btn_layout = QHBoxLayout()
+        
+        self.btn_analyze = QPushButton("🔍 Анализировать")
+        self.btn_analyze.clicked.connect(self._run_analysis)
+        self.btn_analyze.setStyleSheet("font-weight: bold; padding: 5px;")
+        
+        btn_layout.addWidget(self.btn_analyze)
+        btn_layout.addStretch()
+        
+        self.btn_apply = QPushButton("Применить")
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.clicked.connect(self.accept)
+        
+        self.btn_cancel = QPushButton("Отмена")
+        self.btn_cancel.clicked.connect(self.reject)
+
+        btn_layout.addWidget(self.btn_apply)
+        btn_layout.addWidget(self.btn_cancel)
+        layout.addLayout(btn_layout)
+
+    def _run_analysis(self):
+        """Запускает процесс анализа."""
+        self.btn_analyze.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0) 
+        QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
+        self.candidates_parens.clear()
+        self.candidates_slashes.clear()
+        self.candidates_headers.clear()
+
+        QTimer.singleShot(100, self._perform_analysis_logic)
+
+    def _perform_analysis_logic(self):
+        try:
+            # 1. Анализ форматирования
+            for entry in self.glossary_data:
+                orig = entry.get('original', '')
+                rus = entry.get('rus', '')
+                ident_key = (orig, rus) # Уникальный идентификатор записи для этого сеанса
+                
+                # Скобки
+                if '(' in rus or '（' in rus:
+                    if not ('(' in orig or ')' in orig or '（' in orig):
+                        if re.search(r'(?:[\(\（](.*?)[\)\）])', rus):
+                            self.candidates_parens.add(ident_key)
+
+                # Слеши
+                if '/' in rus:
+                    if '/' not in orig:
+                        parts = [p for p in rus.split('/') if p.strip()]
+                        if len(parts) > 1:
+                            self.candidates_slashes.add(ident_key)
+
+            # 2. Анализ заголовков (если есть EPUB)
+            # if self.epub_path and os.path.exists(self.epub_path):
+                # epub_cache = {}
+                # try:
+                    # self._analyze_epub_structure(epub_cache)
+                    # for entry in self.glossary_data:
+                        # term = entry.get('original', '').strip()
+                        # rus = entry.get('rus', '')
+                        # ident_key = (entry.get('original', ''), rus)
+                        
+                        # if self._should_remove_as_header(term, epub_cache):
+                            # self.candidates_headers.add(ident_key)
+                # except Exception as e:
+                    # print(f"[Analysis Error] {e}")
+
+            # 3. Обновление UI
+            self._update_checkboxes()
+            self.btn_apply.setEnabled(True)
+
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.progress_bar.setVisible(False)
+            self.btn_analyze.setEnabled(True)
+            self.btn_analyze.setText("🔍 Пересканировать")
+
+    def _update_checkboxes(self):
+        n_parens = len(self.candidates_parens)
+        self.check_parens.setText(f"Перенести скобки (...) в примечание (Найдено: {n_parens})")
+        self.check_parens.setEnabled(n_parens > 0)
+        self.check_parens.setChecked(n_parens > 0)
+
+        n_slashes = len(self.candidates_slashes)
+        self.check_slashes.setText(f"Разделить варианты через слеш '/' (Найдено: {n_slashes})")
+        self.check_slashes.setEnabled(n_slashes > 0)
+        self.check_slashes.setChecked(n_slashes > 0)
+
+        n_headers = len(self.candidates_headers)
+        if self.epub_path:
+            self.check_headers.setText(f"Удалить термины-заголовки (Найдено: {n_headers})")
+            self.check_headers.setEnabled(n_headers > 0)
+            self.check_headers.setChecked(n_headers > 0)
+        else:
+            self.check_headers.setText("Удалить термины-заголовки (Нет EPUB файла)")
+            self.check_headers.setEnabled(False)
+
+    def process_data(self):
+        """
+        Генерирует финальный список.
+        """
+        new_list = []
+        
+        do_parens = self.check_parens.isChecked()
+        do_slashes = self.check_slashes.isChecked()
+        do_headers = self.check_headers.isChecked()
+        
+        stat_formatted = 0
+        stat_removed = 0
+
+        for entry in self.glossary_data:
+            orig = entry.get('original', '')
+            rus = entry.get('rus', '')
+            ident_key = (orig, rus) # Ключ для проверки
+
+            # 1. Проверка на удаление
+            if do_headers and ident_key in self.candidates_headers:
+                stat_removed += 1
+                continue 
+
+            # Создаем копию
+            new_entry = entry.copy()
+            modified = False
+            
+            # Работаем с локальными переменными для удобства
+            curr_rus = new_entry.get('rus', '')
+            curr_note = new_entry.get('note', '')
+
+            # 2. Обработка скобок
+            if do_parens and ident_key in self.candidates_parens:
+                matches = list(re.finditer(r'\s*(?:[\(\（](.*?)[\)\）])', curr_rus))
+                if matches:
+                    extracted = []
+                    for match in reversed(matches):
+                        content = match.group(1).strip()
+                        if content: extracted.insert(0, content)
+                        s, e = match.span()
+                        curr_rus = curr_rus[:s] + curr_rus[e:]
+                    
+                    curr_rus = curr_rus.strip()
+                    if extracted:
+                        add_note = "; ".join(extracted)
+                        curr_note = f"{add_note}; {curr_note}" if curr_note else add_note
+                        modified = True
+
+            # 3. Обработка слешей
+            if do_slashes and ident_key in self.candidates_slashes and '/' in curr_rus:
+                parts = [p.strip() for p in curr_rus.split('/') if p.strip()]
+                if len(parts) > 1:
+                    curr_rus = parts[0]
+                    synonyms = ", ".join([f"[{s}]" for s in parts[1:]])
+                    add_note = f"(Допустимые синонимы/омонимы: {synonyms})"
+                    curr_note = f"{curr_note} {add_note}" if curr_note else add_note
+                    modified = True
+
+            if modified:
+                new_entry['rus'] = curr_rus
+                new_entry['note'] = curr_note
+                stat_formatted += 1
+            
+            new_list.append(new_entry)
+            
+        return new_list, stat_formatted + stat_removed
+
+    # --- Методы анализа EPUB ---
+    def _analyze_epub_structure(self, cache_dict):
+        ignore_patterns = ['toc', 'nav', 'cover', 'style', 'css']
+        with zipfile.ZipFile(self.epub_path, 'r') as zf:
+            for filename in zf.namelist():
+                if not filename.endswith(('.html', '.xhtml', '.htm')): continue
+                if any(pat in filename.lower() for pat in ignore_patterns): continue
+                try:
+                    raw_content = zf.read(filename).decode('utf-8', 'ignore')
+                    # H1 / Title
+                    h1s = re.findall(r'<h1.*?>(.*?)</h1>', raw_content, re.IGNORECASE | re.DOTALL)
+                    titles = re.findall(r'<title.*?>(.*?)</title>', raw_content, re.IGNORECASE | re.DOTALL)
+                    clean_h1s = [re.sub(r'<[^>]+>', '', h).strip() for h in h1s]
+                    clean_titles = [re.sub(r'<[^>]+>', '', t).strip() for t in titles]
+                    
+                    # Чистый текст для анализа длины
+                    no_script = re.sub(r'<(script|style).*?>.*?</\1>', '', raw_content, flags=re.DOTALL | re.IGNORECASE)
+                    blocks_replaced = re.sub(r'</?(p|div|br|h\d|li).*?>', '\n', no_script)
+                    text_only = re.sub(r'<[^>]+>', '', blocks_replaced)
+                    lines = [line.strip() for line in text_only.split('\n') if line.strip()]
+
+                    cache_dict[filename] = {
+                        'lines': lines,
+                        'h1s': set(clean_h1s),
+                        'titles': set(clean_titles)
+                    }
+                except Exception: pass
+
+    def _should_remove_as_header(self, term, cache_dict):
+        if not term or len(term) < 2: return False
+        term_lower = term.lower()
+        found_count = 0
+        last_data = None
+        
+        for fname, data in cache_dict.items():
+            found_in_file = False
+            for line in data['lines']:
+                if term_lower in line.lower():
+                    found_in_file = True
+                    break
+            if found_in_file:
+                found_count += 1
+                last_data = data
+            if found_count > 1: return False 
+
+        if found_count == 0: return False
+        
+        # Только в 1 файле. Проверяем контекст.
+        is_header = False
+        for h in last_data['h1s']:
+            if term_lower in h.lower(): is_header = True; break
+        if not is_header:
+            for t in last_data['titles']:
+                if term_lower in t.lower(): is_header = True; break
+        
+        if not is_header: return False 
+
+        # Проверка на нарратив
+        term_len = len(term)
+        for line in last_data['lines']:
+            if term_lower in line.lower():
+                line_len = len(line)
+                diff = abs(line_len - term_len)
+                if diff / term_len > 0.3: # Если строка на 30% длиннее термина
+                    return False 
+        
+        return True

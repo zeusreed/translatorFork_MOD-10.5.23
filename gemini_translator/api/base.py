@@ -1,0 +1,757 @@
+import threading
+import asyncio
+import aiohttp
+import os
+import re
+import ssl
+import contextvars
+import time
+import sys
+import certifi
+from PyQt6.QtWidgets import QApplication
+from ..utils.async_helpers import run_sync
+from ..utils.debug_logger import create_operation_trace
+from ..utils.helpers import estimate_gemini_tokens
+from .errors import (
+    OperationCancelledError, ContentFilterError, ApiAccessError, RateLimitExceededError, LocationBlockedError, SuccessSignal,
+    ModelNotFoundError, ValidationFailedError, NetworkError, PartialGenerationError, TemporaryRateLimitError, GracefulShutdownInterrupt
+)
+
+_thread_local = threading.local()
+_current_debug_trace = contextvars.ContextVar("current_debug_trace", default=None)
+
+_DEFAULT_TRANSIENT_DISCONNECT_RETRIES = 1
+_DEFAULT_TRANSIENT_DISCONNECT_RETRY_DELAY_SECONDS = 1.0
+
+
+def _get_ssl_context_signature():
+    ssl_cert_file = os.environ.get("SSL_CERT_FILE") or None
+    ssl_cert_dir = os.environ.get("SSL_CERT_DIR") or None
+    if ssl_cert_file or ssl_cert_dir:
+        return ("env", ssl_cert_file, ssl_cert_dir)
+    return ("certifi", certifi.where(), None)
+
+
+def _create_ssl_context():
+    source, cafile, _capath = _get_ssl_context_signature()
+    if source == "env":
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=cafile)
+
+try:
+    import requests
+    from requests.exceptions import RequestException as RequestsError
+except ImportError:
+    requests = None
+    class RequestsError(Exception): pass
+
+try:
+    import socks
+    from aiohttp_socks import ProxyConnector, ProxyType
+    PROXY_ERRORS = (socks.ProxyError, socks.GeneralProxyError, socks.ProxyConnectionError)
+except (ImportError, AttributeError):
+    socks = None
+    ProxyConnector = None
+    ProxyType = None
+    PROXY_ERRORS = ()
+
+def get_worker_loop():
+    """Получает или создает event loop для текущего потока воркера."""
+    if not hasattr(_thread_local, "loop") or _thread_local.loop.is_closed():
+        if sys.platform == "win32":
+            proactor_loop_class = getattr(asyncio, "ProactorEventLoop", None)
+            if proactor_loop_class is not None:
+                _thread_local.loop = proactor_loop_class()
+            else:
+                _thread_local.loop = asyncio.new_event_loop()
+        else:
+            _thread_local.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_thread_local.loop)
+    return _thread_local.loop
+
+class BaseApiHandler:
+    """
+    Базовый класс-стратегия с умной гибридной логикой.
+    Версия 5.0: Исправлена диспетчеризация асинхронных вызовов.
+    """
+    def __init__(self, worker):
+        super().__init__()
+        self.worker = worker
+        self.is_async_native = self.worker.provider_config.get("is_async", False)
+        self.proxy_settings = None
+        # Per-handler aiohttp session ownership (bound to the running loop on
+        # first use). Replaces the old thread-local session so workers can share
+        # one event loop while keeping one connector pool per key.
+        self._session = None
+        self._session_proxy_signature = None
+        self._session_timeout = None
+        self._session_ssl_context_signature = None
+
+    def _proactive_session_init(self):
+        # No-op: the session is created lazily and asynchronously on first
+        # `await self._get_or_create_session_internal()` (e.g. in call_api).
+        # The old run_until_complete here cannot run on an already-running shared
+        # loop. Kept as a method so existing setup_client callers stay valid.
+        return
+
+    def _estimate_token_usage(self, prompt, response_text) -> dict:
+        input_tokens = estimate_gemini_tokens(prompt)
+        output_tokens = estimate_gemini_tokens(response_text)
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "estimated": True,
+            "model_id": getattr(self.worker, "model_id", None),
+            "provider": (getattr(self.worker, "model_config", {}) or {}).get("provider"),
+        }
+
+    def _post_token_usage(self, prompt, response_text) -> None:
+        try:
+            usage = self._estimate_token_usage(prompt, response_text)
+        except Exception:
+            return
+
+        poster = getattr(self.worker, "_post_event", None)
+        if callable(poster):
+            poster("token_usage_updated", usage)
+
+    def setup_client(self, client_override=None, proxy_settings=None):
+        """Базовая настройка."""
+        self.proxy_settings = proxy_settings
+        return True
+
+    def _get_proxy_signature(self):
+        """Returns a stable signature for the active proxy configuration."""
+        if not self.proxy_settings or not self.proxy_settings.get('enabled'):
+            return None
+
+        return (
+            str(self.proxy_settings.get('type', 'SOCKS5')).upper(),
+            str(self.proxy_settings.get('host') or ''),
+            str(self.proxy_settings.get('port') or ''),
+            str(self.proxy_settings.get('user') or ''),
+            str(self.proxy_settings.get('pass') or ''),
+        )
+
+    def _build_connector(self, ssl_context):
+        """Builds this handler's aiohttp connector (proxy-aware)."""
+        if self.proxy_settings and self.proxy_settings.get('enabled'):
+            try:
+                host = self.proxy_settings.get('host')
+                port = self.proxy_settings.get('port')
+                p_type = self.proxy_settings.get('type', 'SOCKS5').lower()
+                user = self.proxy_settings.get('user')
+                pwd = self.proxy_settings.get('pass')
+
+                if host and port:
+                    auth = f"{user}:{pwd}@" if user and pwd else ""
+                    url = f"{p_type}://{auth}{host}:{port}"
+                    return ProxyConnector.from_url(url, rdns=True, ssl=ssl_context)
+            except Exception as e:
+                print(f"[API ERROR] Не удалось создать прокси-коннектор: {e}")
+        return aiohttp.TCPConnector(ssl=ssl_context)
+
+    async def _get_or_create_session_internal(self, api_timeout=600):
+        """[Внутренний] Лениво создает per-handler сессию, привязанную к текущему
+        running loop (для воркеров — общий runtime-loop; для consistency engine /
+        benchmark — их собственный loop)."""
+        desired_proxy_signature = self._get_proxy_signature()
+        desired_ssl_context_signature = _get_ssl_context_signature()
+
+        if self._session is not None and not self._session.closed:
+            if (
+                self._session_proxy_signature == desired_proxy_signature
+                and self._session_timeout == api_timeout
+                and self._session_ssl_context_signature == desired_ssl_context_signature
+            ):
+                return self._session
+            await self._session.close()
+            self._session = None
+
+        ssl_context = _create_ssl_context()
+        connector = self._build_connector(ssl_context)
+        timeout = aiohttp.ClientTimeout(total=api_timeout)
+        # No explicit loop=: ClientSession binds to asyncio.get_running_loop(),
+        # so the session and its connector always share the loop running this call.
+        self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        self._session_proxy_signature = desired_proxy_signature
+        self._session_timeout = api_timeout
+        self._session_ssl_context_signature = desired_ssl_context_signature
+        return self._session
+
+    async def _close_thread_session_internal(self):
+        """[Внутренний] Закрывает per-handler сессию."""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+        self._session_proxy_signature = None
+        self._session_timeout = None
+        self._session_ssl_context_signature = None
+
+    def _create_debug_trace(self, log_prefix):
+        if not getattr(self.worker, "debug_logging_enabled", False):
+            return None
+
+        context_getter = getattr(self.worker, "get_debug_operation_context", None)
+        operation_context = context_getter() if callable(context_getter) else {}
+        trace = create_operation_trace(
+            worker=self.worker,
+            log_prefix=log_prefix,
+            operation_context=operation_context,
+            raw_filters=getattr(self.worker, "debug_operation_filters", None),
+            max_total_mb=getattr(self.worker, "debug_max_log_mb", 128),
+        )
+
+        if trace and trace.session_announcement_needed:
+            self.worker._post_event('log_message', {
+                'message': f"[DEBUG] Логи отладки сессии активны: {trace.session_dir.name}",
+                'file_path': str(trace.session_dir),
+                'file_label': 'Открыть папку debug',
+            })
+        return trace
+
+    def _debug_record_request(self, raw_request=None, *, attempt=1, extra=None):
+        trace = _current_debug_trace.get()
+        if trace:
+            trace.write_event("request", attempt=attempt, raw_request=raw_request, extra=extra)
+
+    def _has_debug_trace(self) -> bool:
+        return _current_debug_trace.get() is not None
+
+    def _debug_record_response(self, raw_response=None, *, attempt=1, status=None, extra=None):
+        trace = _current_debug_trace.get()
+        if trace:
+            trace.write_event(
+                "response",
+                attempt=attempt,
+                raw_response=raw_response,
+                status=status,
+                extra=extra,
+            )
+
+    def _debug_record_error(self, error, *, attempt=1, status=None, raw_response=None, extra=None):
+        trace = _current_debug_trace.get()
+        if trace:
+            trace.write_event(
+                "error",
+                attempt=attempt,
+                raw_response=raw_response,
+                status=status or self._debug_status_from_exception(error),
+                error=error,
+                extra=extra,
+            )
+
+    def _debug_status_from_exception(self, error: Exception) -> str:
+        if isinstance(error, OperationCancelledError):
+            return "cancelled"
+        if isinstance(error, ContentFilterError):
+            return "content_filter"
+        if isinstance(error, PartialGenerationError):
+            return "partial_generation"
+        if isinstance(error, TemporaryRateLimitError):
+            return "temporary_rate_limit"
+        if isinstance(error, RateLimitExceededError):
+            return "rate_limit"
+        if isinstance(error, LocationBlockedError):
+            return "location_blocked"
+        if isinstance(error, ModelNotFoundError):
+            return "model_not_found"
+        if isinstance(error, ValidationFailedError):
+            return "validation_failed"
+        if isinstance(error, NetworkError):
+            return "network_error"
+        return type(error).__name__.lower()
+
+    def _config_value(self, name, default=None):
+        model_config = getattr(self.worker, "model_config", None)
+        if isinstance(model_config, dict) and name in model_config:
+            return model_config.get(name)
+
+        provider_config = getattr(self.worker, "provider_config", None)
+        if isinstance(provider_config, dict) and name in provider_config:
+            return provider_config.get(name)
+
+        return default
+
+    def _transient_disconnect_retry_attempts(self) -> int:
+        raw_value = self._config_value(
+            "transient_disconnect_retries",
+            _DEFAULT_TRANSIENT_DISCONNECT_RETRIES,
+        )
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return _DEFAULT_TRANSIENT_DISCONNECT_RETRIES
+
+    def _transient_disconnect_retry_delay(self, attempt: int) -> float:
+        raw_value = self._config_value(
+            "transient_disconnect_retry_delay_seconds",
+            _DEFAULT_TRANSIENT_DISCONNECT_RETRY_DELAY_SECONDS,
+        )
+        try:
+            base_delay = max(0.0, float(raw_value))
+        except (TypeError, ValueError):
+            base_delay = _DEFAULT_TRANSIENT_DISCONNECT_RETRY_DELAY_SECONDS
+        return base_delay * max(1, attempt)
+
+    def _exception_chain(self, error: Exception):
+        seen = set()
+        stack = [error]
+        while stack:
+            current = stack.pop()
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            yield current
+            cause = getattr(current, "__cause__", None)
+            context = getattr(current, "__context__", None)
+            if context is not None:
+                stack.append(context)
+            if cause is not None:
+                stack.append(cause)
+
+    def _is_transient_disconnect_error(self, error: Exception) -> bool:
+        transient_aiohttp_types = [aiohttp.ServerDisconnectedError, aiohttp.ClientPayloadError]
+        for type_name in ("ClientConnectionResetError",):
+            transient_type = getattr(aiohttp, type_name, None)
+            if transient_type is not None:
+                transient_aiohttp_types.append(transient_type)
+        transient_error_types = tuple(transient_aiohttp_types)
+
+        text_parts = []
+        for chained_error in self._exception_chain(error):
+            if isinstance(chained_error, transient_error_types):
+                return True
+            if isinstance(chained_error, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+                return True
+            if isinstance(chained_error, OSError):
+                os_code = getattr(chained_error, "winerror", None) or getattr(chained_error, "errno", None)
+                if os_code in {32, 54, 10053, 10054}:
+                    return True
+            text_parts.append(f"{type(chained_error).__name__}: {chained_error}".lower())
+
+        error_text = " ".join(text_parts)
+        return (
+            "serverdisconnectederror" in error_text
+            or "server disconnected" in error_text
+            or "connection reset by peer" in error_text
+        )
+
+    def _should_retry_transient_disconnect(self, error: Exception, attempt: int, max_retries: int) -> bool:
+        return attempt <= max_retries and self._is_transient_disconnect_error(error)
+
+    def _format_transport_error(self, error: Exception, service_name: str | None = None) -> str:
+        """Describe transport failures without labelling every disconnect as SSL."""
+        context = f" при запросе к {service_name}" if service_name else ""
+        if isinstance(error, aiohttp.ServerDisconnectedError):
+            category = "Сервер разорвал соединение"
+        elif isinstance(error, (aiohttp.ClientSSLError, ssl.SSLError)):
+            category = "Ошибка SSL/TLS"
+        else:
+            category = "Сетевой сбой"
+        return f"{category}{context} ({type(error).__name__}): {error}"
+
+    def _temperature_payload_value(self):
+        if not getattr(self.worker, "temperature_override_enabled", True):
+            return None
+        value = getattr(self.worker, "temperature", None)
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _finalize_debug_trace(self, trace, *, started_at, status, error=None):
+        if not trace:
+            return
+
+        duration_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+        trace.finalize(status=status, duration_ms=duration_ms, error=error)
+
+        if error is not None:
+            self.worker._post_event('log_message', {
+                'message': f"[DEBUG] Сохранен файл отладки для ошибки: {type(error).__name__}",
+                'file_path': str(trace.operation_path),
+                'file_label': 'Открыть debug-лог',
+            })
+
+    
+    def _force_session_reset(self):
+        """
+        [Внутренний] Сбрасывает per-handler сессию при критических ошибках
+        соединения (ServerDisconnected и т.д.), чтобы следующий запрос создал
+        чистое подключение. Sync, fire-and-forget: всегда вызывается из активного
+        API-вызова на running loop; на teardown сессию закроет
+        _close_thread_session_internal (см. контракт в run_async).
+        """
+        session = self._session
+        self._session = None
+        self._session_proxy_signature = None
+        self._session_timeout = None
+        self._session_ssl_context_signature = None
+        if session is not None and not session.closed:
+            try:
+                asyncio.get_running_loop().create_task(session.close())
+            except RuntimeError:
+                pass  # нет running loop — ссылку уже сбросили
+    
+    
+    
+    def _is_shutdown_cancellation(self) -> bool:
+        """True when a CancelledError reflects a user/system stop rather than a
+        network-level interruption.
+
+        On teardown the runtime cancels in-flight coroutines
+        (async_worker_runtime.stop_workers) — the worker's is_cancelled may not be
+        set yet, but during a graceful stop is_shutting_down is. Both must count,
+        otherwise the cancellation is misclassified as a NETWORK error and gets
+        logged + requeued instead of being silently treated as CANCEL."""
+        worker = self.worker
+        return bool(getattr(worker, 'is_cancelled', False)
+                    or getattr(worker, 'is_shutting_down', False))
+
+    async def execute_api_call(self, prompt, log_prefix, allow_incomplete=False, debug=False, use_stream=True, max_output_tokens=None):
+        self.worker.settings_manager.increment_request_count(self.worker.api_key, self.worker.model_id)
+        trace = self._create_debug_trace(log_prefix)
+        trace_token = _current_debug_trace.set(trace)
+        started_at = time.perf_counter()
+        attempt = 1
+        transient_disconnect_retries = self._transient_disconnect_retry_attempts()
+
+        try:
+            while True:
+                try:
+                    if self.is_async_native:
+                        result = await self._async_executor(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
+                    else:
+                        result = await self._sync_executor_wrapper(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
+                    break
+                except asyncio.CancelledError as exc:
+                    if self._is_shutdown_cancellation():
+                        raise OperationCancelledError("Операция отменена системой (asyncio.CancelledError)") from exc
+
+                    error_msg = "Запрос прерван (CancelledError). Вероятная причина: таймаут DNS или сброс соединения."
+                    self._force_session_reset()
+                    raise NetworkError(error_msg, delay_seconds=10) from exc
+                except Exception as exc:
+                    if self._should_retry_transient_disconnect(exc, attempt, transient_disconnect_retries):
+                        self._debug_record_error(
+                            exc,
+                            attempt=attempt,
+                            extra={
+                                "transient_disconnect_retry": True,
+                                "next_attempt": attempt + 1,
+                            },
+                        )
+                        self._force_session_reset()
+                        delay = self._transient_disconnect_retry_delay(attempt)
+                        if delay:
+                            await asyncio.sleep(delay)
+                        attempt += 1
+                        continue
+
+                    self._process_exception_and_counters(exc)
+                    raise
+
+            self._finalize_debug_trace(trace, started_at=started_at, status="success")
+            self._post_token_usage(prompt, result)
+            return result
+        except Exception as exc:
+            self._finalize_debug_trace(
+                trace,
+                started_at=started_at,
+                status=self._debug_status_from_exception(exc),
+                error=exc,
+            )
+            raise
+        finally:
+            _current_debug_trace.reset(trace_token)
+
+    async def _async_executor(self, prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens):
+        """
+        Обертка для асинхронных вызовов.
+        """
+        # 1. Создаем корутину вызова API. 
+        # ВАЖНО: Это только объект, код внутри call_api еще не выполняется.
+        api_coroutine = self.call_api(
+            prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens
+        )
+        
+        api_timeout = self.worker.provider_config.get("base_timeout", 600)
+
+        # 2. Оборачиваем корутину в wait_for (тоже корутина)
+        api_task_with_timeout = asyncio.wait_for(api_coroutine, timeout=api_timeout)
+
+        # 3. Создаем задачи для цикла событий. Вот ТУТ они начинают выполняться.
+        checker_task = asyncio.create_task(self._cancellation_checker())
+        api_task = asyncio.create_task(api_task_with_timeout)
+        
+        try:
+            done, pending = await asyncio.wait({api_task, checker_task}, return_when=asyncio.FIRST_COMPLETED)
+            
+            if checker_task in done:
+                # Если сработала отмена
+                api_task.cancel()
+                raise OperationCancelledError("Отмена обнаружена во время ожидания API")
+            
+            if api_task in done:
+                # Если API ответило (или упало с ошибкой)
+                return await api_task
+                
+        except asyncio.TimeoutError:
+            raise NetworkError(f"Глобальный таймаут API ({api_timeout}с) превышен.", delay_seconds=30)
+        finally:
+            await self._cancel_and_drain_tasks(checker_task, api_task)
+
+    async def _sync_executor_wrapper(self, prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens):
+        """Обертка для СИНХРОННЫХ вызовов (через run_sync)."""
+        api_timeout = self.worker.provider_config.get("base_timeout", 600)
+        
+        api_coro = run_sync(
+            self.call_api,
+            prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens,
+            forget=False,
+            timeout=api_timeout,
+            executor=getattr(self.worker, "sync_executor", None),
+        )
+        
+        checker_task = asyncio.create_task(self._cancellation_checker())
+        api_task = asyncio.create_task(api_coro)
+        
+        try:
+            done, pending = await asyncio.wait({api_task, checker_task}, return_when=asyncio.FIRST_COMPLETED)
+            if checker_task in done:
+                raise OperationCancelledError("Отмена обнаружена во время ожидания API")
+            if api_task in done:
+                return await api_task
+        except asyncio.TimeoutError:
+            raise NetworkError(f"Глобальный таймаут API ({api_timeout}с) превышен.")
+        finally:
+            await self._cancel_and_drain_tasks(checker_task, api_task)
+
+    async def _cancellation_checker(self):
+        """Ждёт отмену событийно (cancel() взводит _cancel_async_event через
+        call_soon_threadsafe). Поллинг каждые 200мс остаётся только как
+        fallback для legacy-пути run() без выделенного события — иначе это
+        5 холостых пробуждений/сек на каждый запрос в полёте."""
+        cancel_event = getattr(self.worker, '_cancel_async_event', None)
+        if cancel_event is not None:
+            while not self.worker.is_cancelled:
+                await cancel_event.wait()
+            return
+        while not self.worker.is_cancelled:
+            await asyncio.sleep(0.2)
+
+    async def _cancel_and_drain_tasks(self, *tasks):
+        """Отменяет owned-задачи и забирает их исключения перед shutdown."""
+        real_tasks = [task for task in tasks if task is not None]
+        for task in real_tasks:
+            if not task.done():
+                task.cancel()
+        if real_tasks:
+            await asyncio.gather(*real_tasks, return_exceptions=True)
+    
+    def call_api(self, prompt, log_prefix, allow_incomplete=False, use_stream=True, debug=False, max_output_tokens=None):
+        """
+        Основной метод. Реализации должны вызывать self._get_or_create_session_internal().
+        """
+        raise NotImplementedError
+    
+    def _process_exception_and_counters(self, e: Exception):
+        # 1. Специфичная логика для PartialGenerationError
+        if isinstance(e, PartialGenerationError):
+            # Проводим диагностику текста на зацикливание
+            if self._detect_looping(e.partial_text):
+                # ВМЕШАТЕЛЬСТВО: Если найден цикл, превращаем ошибку в ValidationFailedError.
+                # Это заставит воркер сбросить текущий прогресс и начать генерацию заново,
+                # вместо того чтобы продолжать дописывать повторяющийся бред.
+                raise ValidationFailedError(f"Обнаружено зацикливание текста в прерванном ответе. Причина сброса: {e.reason}")
+            
+            # Если цикла нет - пробрасываем как есть (воркер попробует дописать)
+            raise e
+        
+        
+        # Стандартная обработка ошибок
+        if isinstance(e, (
+            OperationCancelledError, ContentFilterError, ValidationFailedError
+        )):
+            raise e
+
+        self.worker.settings_manager.decrement_request_count(self.worker.api_key, self.worker.model_id)
+        
+        # ЛОГИКА СБРОСА СЕССИИ
+        # Если это NetworkError или ошибка aiohttp, сбрасываем сессию,
+        # так как коннектор может быть в "битом" состоянии.
+        is_aiohttp_error = isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError, OSError))
+        # Проверяем также по тексту ошибки, если она завернута
+        error_text = str(e).lower()
+        is_disconnect = "disconnected" in error_text or "connection" in error_text or "closed" in error_text
+        
+        if is_aiohttp_error or is_disconnect or isinstance(e, NetworkError):
+            self._force_session_reset()
+        
+        if ("http error" in error_text and "403" in error_text) or ("http 403" in error_text):
+            raise LocationBlockedError(f"Ошибка доступа 403") from e
+        
+        # Далее стандартная классификация для ретраев
+        if isinstance(e, (
+            ApiAccessError, NetworkError, TemporaryRateLimitError, RateLimitExceededError, LocationBlockedError, ModelNotFoundError
+        )):
+            raise e
+        
+        if "сannot connect to host" in error_text or "getaddrinfo failed" in error_text:
+            raise NetworkError(f"Нет связи с сервером, или нет интернета.", delay_seconds=60) from e
+        
+
+        
+        if isinstance(e, aiohttp.ClientResponseError) and e.status == 429:
+            raise TemporaryRateLimitError(f"Превышен минутный лимит (код 429)", delay_seconds=65) from e
+        
+        if isinstance(e, aiohttp.ClientPayloadError):
+            error_msg = "Сетевой сбой: Некорректный ответ Сервера."
+            raise NetworkError(error_msg, delay_seconds=30) from e
+        
+        if isinstance(e, aiohttp.ClientResponseError) and e.status in [401, 403]:
+            raise NetworkError(f"Доступ запрещен (код {e.status}): {e.reason}", delay_seconds=30) from e
+        
+        if 'api key not valid' in error_text or 'permission denied' in error_text:
+            raise RateLimitExceededError(f"Невалидный/заблокированный API ключ {self.worker.api_key[-4:]}: {str(e)}") from e
+
+        if "вам включили лимиты" in error_text or "quota_exceeded" in error_text:
+            raise RateLimitExceededError(str(e))
+        
+        if "user location is not supported" in error_text:
+            raise LocationBlockedError(f"Геоблок: {str(e)}") from e
+            
+        if "model" in error_text and ("not found" in error_text or "is not supported" in error_text):
+            raise ModelNotFoundError(f"Модель не найдена: {str(e)}") from e
+        
+        if isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError, RequestsError, OSError) + PROXY_ERRORS):
+            error_msg = f"Сетевой сбой ({type(e).__name__}): {str(e)}"
+            raise NetworkError(error_msg, delay_seconds=30) from e
+
+        raise e
+        
+    def _detect_looping(self, text):
+        """
+        [Диагностика 3.0] Анализ зацикливания в хвосте ответа.
+        Для PartialGenerationError важен именно участок перед обрывом:
+        повторяющиеся абзацы в середине главы сами по себе не означают,
+        что модель ушла в петлю.
+        """
+        if not text: return False
+        
+        # 1. Парсинг и очистка
+        raw_blocks = re.split(r'</p>|\n\s*\n', text)
+        blocks = []
+        for b in raw_blocks:
+            clean = re.sub(r'<[^>]+>', '', b).strip()
+            clean = re.sub(r'\s+', ' ', clean)
+            if clean: blocks.append(clean)
+            
+        if len(blocks) < 4: return False
+
+        tail_blocks = blocks[-32:]
+        if self._has_repeated_suffix_cycle(tail_blocks):
+            return True
+
+        if self._has_repeated_tail_cluster(blocks):
+            return True
+
+        return False
+
+    def _sequence_text_length(self, blocks):
+        return sum(len(block) for block in blocks)
+
+    def _has_repeated_suffix_cycle(self, blocks):
+        max_period = min(8, len(blocks) // 2)
+        for period in range(1, max_period + 1):
+            pattern = blocks[-period:]
+            pattern_len = self._sequence_text_length(pattern)
+            if pattern_len <= 0:
+                continue
+
+            repetitions = 1
+            cursor = len(blocks) - period
+            while cursor - period >= 0 and blocks[cursor - period:cursor] == pattern:
+                repetitions += 1
+                cursor -= period
+
+            if period == 1:
+                is_short = len(pattern[0]) < 30
+                required_repetitions = 8 if is_short else 4
+                min_total_chars = 120
+            else:
+                required_repetitions = 3
+                min_total_chars = 180
+
+            if repetitions >= required_repetitions and pattern_len * repetitions >= min_total_chars:
+                return True
+
+        return False
+
+    def _has_repeated_tail_cluster(self, blocks):
+        max_cluster_size = min(6, len(blocks) // 2)
+        for size in range(max_cluster_size, 2, -1):
+            suffix = blocks[-size:]
+            if self._sequence_text_length(suffix) < 180:
+                continue
+
+            suffix_start = len(blocks) - size
+            latest_non_overlapping_start = suffix_start - size
+            for start in range(0, latest_non_overlapping_start + 1):
+                if blocks[start:start + size] == suffix:
+                    return True
+
+        return False
+        
+        
+from abc import ABC, abstractmethod
+
+
+class BaseServer(ABC):
+    """
+    Абстрактный базовый класс для локальных серверов (стратегия).
+    Определяет интерфейс управления жизненным циклом и валидации.
+    """
+    def __init__(self, port=None):
+        self.port = port
+        self._is_running = False
+
+    @abstractmethod
+    def start(self, anonymous=True):
+        """Запускает сервер в отдельном потоке."""
+        pass
+
+    @abstractmethod
+    def stop(self):
+        """Останавливает сервер."""
+        pass
+
+    @abstractmethod
+    def is_running(self) -> bool:
+        """Возвращает True, если сервер активен и отвечает."""
+        pass
+
+    @abstractmethod
+    def get_url(self) -> str | None:
+        """Возвращает базовый URL запущенного сервера (например http://127.0.0.1:PORT)."""
+        pass
+    
+    @abstractmethod
+    def validate_token(self, token: str) -> dict:
+        """
+        Проверяет один токен.
+        Return: {'valid': bool, 'message': str, 'email': str, 'is_pro': bool}
+        """
+        pass
+
+    @abstractmethod
+    def validate_batch(self, tokens: list) -> list:
+        """
+        Проверяет список токенов.
+        Return: list[dict] (результаты validate_token + поле 'token')
+        """
+        pass

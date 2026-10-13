@@ -1,0 +1,509 @@
+import os
+import sys
+import tempfile
+import types
+import unittest
+from unittest.mock import patch
+
+from gemini_translator.ui.dialogs.validation import (
+    TranslationValidatorDialog,
+    TranslationValidatorPage,
+)
+from gemini_translator.utils.validation_cache import (
+    build_file_fingerprint,
+    build_snapshot_entry,
+    build_text_hash,
+)
+
+
+class _ComboStub:
+    def __init__(self, value):
+        self._value = value
+
+    def currentData(self):
+        return self._value
+
+
+class _CheckStub:
+    def __init__(self, checked=False):
+        self._checked = checked
+
+    def isChecked(self):
+        return self._checked
+
+
+class _SpinStub:
+    def __init__(self, value):
+        self._value = value
+
+    def value(self):
+        return self._value
+
+
+class _ProblemCellItem:
+    def __init__(self):
+        self.text = None
+
+    def setText(self, text):
+        self.text = text
+
+
+class _ProblemCellTableStub:
+    def __init__(self):
+        self.items = {(0, 1): _ProblemCellItem()}
+        self.widgets = {(0, 1): object()}
+        self.removed_widgets = []
+
+    def removeCellWidget(self, row, column):
+        self.removed_widgets.append((row, column))
+        self.widgets.pop((row, column), None)
+
+    def cellWidget(self, row, column):
+        return self.widgets.get((row, column))
+
+    def item(self, row, column):
+        return self.items.get((row, column))
+
+    def setItem(self, row, column, item):
+        self.items[(row, column)] = item
+
+    def setCellWidget(self, row, column, widget):
+        self.widgets[(row, column)] = widget
+
+
+class _ValidationHarness:
+    _read_text_file = TranslationValidatorDialog._read_text_file
+    _get_current_content_hash = TranslationValidatorDialog._get_current_content_hash
+    _invalidate_analysis_for_data = TranslationValidatorDialog._invalidate_analysis_for_data
+    _create_base_result_data = TranslationValidatorDialog._create_base_result_data
+    _build_row_data_for_file = TranslationValidatorDialog._build_row_data_for_file
+    _get_selected_analysis_mode = TranslationValidatorDialog._get_selected_analysis_mode
+    _get_manual_excluded_paths = TranslationValidatorDialog._get_manual_excluded_paths
+    _get_eligible_analysis_paths = TranslationValidatorDialog._get_eligible_analysis_paths
+    _compute_analysis_targets = TranslationValidatorDialog._compute_analysis_targets
+    _calculate_status_for_data = TranslationValidatorDialog._calculate_status_for_data
+    _update_previous_problem_path_for_data = TranslationValidatorDialog._update_previous_problem_path_for_data
+    _set_problem_cell = TranslationValidatorDialog._set_problem_cell
+
+    def __init__(self):
+        self.validation_snapshot_entries = {}
+        self.validation_snapshot_available = False
+        self._content_hash_cache = {}
+        self.analysis_mode_combo = _ComboStub("all")
+        self.check_revalidate_ok = _CheckStub(False)
+        self.results_data = {}
+        self.dirty_files = set()
+        self.previous_problem_paths = set()
+        self.check_structure = _CheckStub(True)
+        self.check_length_ratio = _CheckStub(True)
+        self.check_simplification = _CheckStub(True)
+        self.check_repeating_chars = _CheckStub(True)
+        self.check_paragraph_size = _CheckStub(True)
+        self.check_untranslated = _CheckStub(True)
+        self.max_paragraph_spinbox = _SpinStub(2000)
+        self.simplification_threshold_spinbox = _SpinStub(30)
+        self.repeating_chars_spinbox = _SpinStub(5)
+
+    def _get_current_ratio_bounds(self):
+        return 0.70, 1.80
+
+    def show_structure_details(self, errors_dict):
+        return None
+
+
+class _ProjectManagerStub:
+    def __init__(self, project_folder, originals, versions_map):
+        self.project_folder = project_folder
+        self._originals = originals
+        self._versions_map = versions_map
+
+    def get_all_originals(self):
+        return list(self._originals)
+
+    def get_versions_for_original(self, original_path):
+        return dict(self._versions_map.get(original_path, {}))
+
+
+class _ProgressDialogStub:
+    def __init__(self, *args, **kwargs):
+        self.value = 0
+
+    def setWindowModality(self, *args, **kwargs):
+        return None
+
+    def show(self):
+        return None
+
+    def close(self):
+        return None
+
+    def wasCanceled(self):
+        return False
+
+    def setValue(self, value):
+        self.value = value
+
+
+class _MessageBoxStub:
+    @staticmethod
+    def warning(*args, **kwargs):
+        return None
+
+
+class ValidationReanalysisTests(unittest.TestCase):
+    def test_cjk_ratio_preset_uses_2_80_minimum(self):
+        ratio_min, ratio_max, description = TranslationValidatorPage.RATIO_PRESETS[
+            "Иероглифический (象 -> A)"
+        ]
+
+        self.assertEqual(ratio_min, 2.80)
+        self.assertEqual(ratio_max, 6.50)
+        self.assertIn("x2.8", description)
+
+    def test_ratio_equal_to_lower_bound_is_not_too_short(self):
+        harness = _ValidationHarness()
+
+        reasons, status = harness._calculate_status_for_data(
+            {
+                "has_cached_analysis": True,
+                "len_orig": 1000,
+                "len_trans": 2800,
+                "ratio_value": 2.80,
+            },
+            override_bounds=(2.80, 6.50),
+        )
+
+        self.assertEqual(reasons, [])
+        self.assertEqual(status, "neutral")
+
+    def test_build_row_data_restores_cached_snapshot_for_unchanged_file(self):
+        harness = _ValidationHarness()
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".html", delete=False) as temp_file:
+            temp_file.write("<p>Hello world</p>")
+            html_path = temp_file.name
+
+        try:
+            internal_path = "Text/chapter1.xhtml"
+            content_hash = build_text_hash("<p>Hello world</p>")
+            harness.validation_snapshot_available = True
+            harness.validation_snapshot_entries[internal_path] = build_snapshot_entry(
+                {
+                    "len_orig": 12,
+                    "len_trans": 15,
+                    "ratio_value": 1.25,
+                    "critical_reasons": ["Mismatch"],
+                },
+                content_hash,
+            )
+
+            data, needs_analysis = harness._build_row_data_for_file(
+                internal_path,
+                html_path,
+                False,
+            )
+
+            self.assertFalse(needs_analysis)
+            self.assertTrue(data["has_cached_analysis"])
+            self.assertEqual(data["len_orig"], 12)
+            self.assertEqual(data["critical_reasons"], ["Mismatch"])
+            self.assertEqual(data["analyzed_content_hash"], content_hash)
+        finally:
+            os.remove(html_path)
+
+    def test_build_row_data_uses_fingerprint_shortcut_without_reading_file(self):
+        harness = _ValidationHarness()
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".html", delete=False) as temp_file:
+            temp_file.write("<p>Hello world</p>")
+            html_path = temp_file.name
+
+        try:
+            internal_path = "Text/chapter_fp.xhtml"
+            content_hash = build_text_hash("<p>Hello world</p>")
+            harness.validation_snapshot_available = True
+            harness.validation_snapshot_entries[internal_path] = build_snapshot_entry(
+                {"len_orig": 12, "len_trans": 15, "critical_reasons": []},
+                content_hash,
+                file_fingerprint=build_file_fingerprint(html_path),
+            )
+            harness._read_text_file = lambda path: self.fail(
+                "файл не должен читаться при совпадении stat-отпечатка"
+            )
+
+            data, needs_analysis = harness._build_row_data_for_file(
+                internal_path,
+                html_path,
+                False,
+            )
+
+            self.assertFalse(needs_analysis)
+            self.assertTrue(data["has_cached_analysis"])
+            self.assertEqual(data["analyzed_content_hash"], content_hash)
+        finally:
+            os.remove(html_path)
+
+    def test_fingerprint_mismatch_falls_back_to_full_read(self):
+        harness = _ValidationHarness()
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".html", delete=False) as temp_file:
+            temp_file.write("<p>Hello world</p>")
+            html_path = temp_file.name
+
+        try:
+            stale_fingerprint = {"size": 1, "mtime_ns": 1}
+            entry = build_snapshot_entry(
+                {"len_orig": 12},
+                build_text_hash("<p>Old</p>"),
+                file_fingerprint=stale_fingerprint,
+            )
+            harness.validation_snapshot_available = True
+            harness.validation_snapshot_entries["Text/chapter_fp2.xhtml"] = entry
+
+            current_hash = harness._get_current_content_hash(html_path, entry)
+
+            self.assertEqual(current_hash, build_text_hash("<p>Hello world</p>"))
+        finally:
+            os.remove(html_path)
+
+    def test_build_row_data_marks_changed_file_for_reanalysis(self):
+        harness = _ValidationHarness()
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".html", delete=False) as temp_file:
+            temp_file.write("<p>Updated content</p>")
+            html_path = temp_file.name
+
+        try:
+            internal_path = "Text/chapter2.xhtml"
+            harness.validation_snapshot_available = True
+            harness.validation_snapshot_entries[internal_path] = build_snapshot_entry(
+                {"len_orig": 10, "len_trans": 11},
+                build_text_hash("<p>Older content</p>"),
+            )
+
+            data, needs_analysis = harness._build_row_data_for_file(
+                internal_path,
+                html_path,
+                False,
+            )
+
+            self.assertTrue(needs_analysis)
+            self.assertFalse(data["has_cached_analysis"])
+            self.assertIsNotNone(data["current_content_hash"])
+            self.assertEqual(
+                data["analyzed_content_hash"],
+                build_text_hash("<p>Older content</p>"),
+            )
+        finally:
+            os.remove(html_path)
+
+    def test_compute_analysis_targets_respects_modes_and_filters(self):
+        harness = _ValidationHarness()
+        harness.results_data = {
+            0: {"internal_html_path": "a.xhtml", "status": "neutral", "is_validated_file": False},
+            1: {"internal_html_path": "b.xhtml", "status": "neutral", "is_validated_file": False},
+            2: {"internal_html_path": "c.xhtml", "status": "neutral", "is_validated_file": False},
+            3: {"internal_html_path": "d.xhtml", "status": "ok", "is_validated_file": False},
+            4: {"internal_html_path": "e.xhtml", "status": "neutral", "is_validated_file": True},
+        }
+        harness.dirty_files = {"a.xhtml", "c.xhtml", "e.xhtml"}
+        harness.previous_problem_paths = {"b.xhtml", "c.xhtml", "d.xhtml", "e.xhtml"}
+
+        harness.analysis_mode_combo = _ComboStub("all")
+        self.assertEqual(harness._compute_analysis_targets(), {"a.xhtml", "b.xhtml", "c.xhtml"})
+        self.assertEqual(
+            harness._compute_analysis_targets(True),
+            {"a.xhtml", "b.xhtml", "c.xhtml"},
+        )
+        self.assertEqual(harness._compute_analysis_targets("c.xhtml"), {"c.xhtml"})
+
+        harness.analysis_mode_combo = _ComboStub("problematic")
+        self.assertEqual(harness._compute_analysis_targets(), {"b.xhtml", "c.xhtml"})
+
+        harness.analysis_mode_combo = _ComboStub("changed")
+        self.assertEqual(harness._compute_analysis_targets(), {"a.xhtml", "c.xhtml"})
+
+        harness.analysis_mode_combo = _ComboStub("problematic_or_changed")
+        self.assertEqual(harness._compute_analysis_targets(), {"a.xhtml", "b.xhtml", "c.xhtml"})
+
+        harness.check_revalidate_ok = _CheckStub(True)
+        self.assertEqual(
+            harness._compute_analysis_targets(),
+            {"a.xhtml", "b.xhtml", "c.xhtml", "e.xhtml"},
+        )
+
+    def test_invalidate_analysis_for_data_clears_cached_problem_markers(self):
+        harness = _ValidationHarness()
+        harness.previous_problem_paths = {"Text/chapter.xhtml"}
+        data = {
+            "internal_html_path": "Text/chapter.xhtml",
+            "translated_html": "<p>Fresh text</p>",
+            "has_cached_analysis": True,
+            "analyzed_content_hash": "old",
+            "critical_reasons": ["Mismatch"],
+            "structural_errors": {"missing_tags": ["p"]},
+            "untranslated_words": ["hero"],
+            "ratio_value": 0.5,
+        }
+
+        harness._invalidate_analysis_for_data(data)
+
+        self.assertFalse(data["has_cached_analysis"])
+        self.assertIsNone(data["analyzed_content_hash"])
+        self.assertEqual(data["current_content_hash"], build_text_hash("<p>Fresh text</p>"))
+        self.assertNotIn("critical_reasons", data)
+        self.assertNotIn("structural_errors", data)
+        self.assertNotIn("untranslated_words", data)
+        self.assertNotIn("ratio_value", data)
+        self.assertNotIn("Text/chapter.xhtml", harness.previous_problem_paths)
+
+    def test_problem_cell_hides_structural_details_when_structure_check_is_off(self):
+        harness = _ValidationHarness()
+        harness.check_structure = _CheckStub(False)
+        harness.table_results = _ProblemCellTableStub()
+
+        harness._set_problem_cell(
+            0,
+            {"structural_errors": {"headings": {"h1": (1, 0)}}},
+            [],
+        )
+
+        self.assertIsNone(harness.table_results.cellWidget(0, 1))
+        self.assertEqual(harness.table_results.items[(0, 1)].text, "")
+        self.assertEqual(harness.table_results.removed_widgets, [(0, 1)])
+
+    def test_problem_cell_keeps_non_structural_reasons_when_structure_check_is_off(self):
+        harness = _ValidationHarness()
+        harness.check_structure = _CheckStub(False)
+        harness.table_results = _ProblemCellTableStub()
+
+        harness._set_problem_cell(
+            0,
+            {"structural_errors": {"headings": {"h1": (1, 0)}}},
+            ["Недоперевод"],
+        )
+
+        self.assertIsNone(harness.table_results.cellWidget(0, 1))
+        self.assertEqual(harness.table_results.items[(0, 1)].text, "Недоперевод")
+
+    def test_previous_problem_paths_follow_fresh_analysis_result(self):
+        harness = _ValidationHarness()
+        harness.previous_problem_paths = {"Text/fixed.xhtml"}
+
+        harness._update_previous_problem_path_for_data(
+            {
+                "internal_html_path": "Text/fixed.xhtml",
+                "status": "neutral",
+                "has_cached_analysis": True,
+                "len_orig": 1000,
+                "len_trans": 1100,
+                "ratio_value": 1.1,
+            }
+        )
+
+        self.assertNotIn("Text/fixed.xhtml", harness.previous_problem_paths)
+
+        harness._update_previous_problem_path_for_data(
+            {
+                "internal_html_path": "Text/problem.xhtml",
+                "status": "neutral",
+                "has_cached_analysis": True,
+                "len_orig": 1000,
+                "len_trans": 100,
+                "ratio_value": 0.1,
+            }
+        )
+
+        self.assertIn("Text/problem.xhtml", harness.previous_problem_paths)
+
+    def test_consistency_check_skips_unreadable_chapter_without_name_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            internal_path = "Text/chapter1.xhtml"
+            rel_path = "translated/chapter1.xhtml"
+            full_path = os.path.join(temp_dir, rel_path)
+
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as temp_file:
+                temp_file.write("<p>Hello</p>")
+
+            fake_dialog_module = types.ModuleType("gemini_translator.ui.dialogs.consistency_checker")
+
+            class _ConsistencyDialogStub:
+                def __init__(self, *args, **kwargs):
+                    self.args = args
+                    self.kwargs = kwargs
+
+                def exec(self):
+                    return 0
+
+            fake_dialog_module.ConsistencyValidatorDialog = _ConsistencyDialogStub
+
+            harness = type("ConsistencyHarness", (), {})()
+            harness.settings_manager = object()
+            harness.project_manager = _ProjectManagerStub(
+                temp_dir,
+                [internal_path],
+                {internal_path: {"": rel_path}},
+            )
+
+            real_open = open
+
+            def _failing_open(path, *args, **kwargs):
+                if os.path.abspath(path) == os.path.abspath(full_path):
+                    raise OSError("boom")
+                return real_open(path, *args, **kwargs)
+
+            with patch.dict(sys.modules, {fake_dialog_module.__name__: fake_dialog_module}), \
+                 patch("gemini_translator.ui.dialogs.validation.QProgressDialog", _ProgressDialogStub), \
+                 patch("gemini_translator.ui.dialogs.validation.QMessageBox", _MessageBoxStub), \
+                 patch("builtins.open", _failing_open):
+                TranslationValidatorDialog._on_consistency_check(harness)
+
+    def test_consistency_check_uses_unsaved_in_memory_translation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            internal_path = "Text/chapter1.xhtml"
+            rel_path = "translated/chapter1.xhtml"
+            full_path = os.path.join(temp_dir, rel_path)
+
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as temp_file:
+                temp_file.write("<p>stale hero</p>")
+
+            captured = {}
+            fake_dialog_module = types.ModuleType("gemini_translator.ui.dialogs.consistency_checker")
+
+            class _ConsistencyDialogStub:
+                def __init__(self, chapters, *args, **kwargs):
+                    captured["chapters"] = chapters
+
+                def exec(self):
+                    return 0
+
+            fake_dialog_module.ConsistencyValidatorDialog = _ConsistencyDialogStub
+
+            harness = type("ConsistencyHarness", (), {})()
+            harness.settings_manager = object()
+            harness.project_manager = _ProjectManagerStub(
+                temp_dir,
+                [internal_path],
+                {internal_path: {"": rel_path}},
+            )
+            harness.results_data = {
+                0: {
+                    "internal_html_path": internal_path,
+                    "path": full_path,
+                    "translated_html": "<p>fixed in memory</p>",
+                    "is_edited": True,
+                }
+            }
+
+            with patch.dict(sys.modules, {fake_dialog_module.__name__: fake_dialog_module}), \
+                 patch("gemini_translator.ui.dialogs.validation.QProgressDialog", _ProgressDialogStub), \
+                 patch("gemini_translator.ui.dialogs.validation.QMessageBox", _MessageBoxStub):
+                TranslationValidatorDialog._on_consistency_check(harness)
+
+            self.assertEqual(captured["chapters"][0]["content"], "<p>fixed in memory</p>")
+
+
+if __name__ == "__main__":
+    unittest.main()

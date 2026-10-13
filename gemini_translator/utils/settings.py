@@ -1,0 +1,1251 @@
+import os
+import json
+import time
+import tempfile
+from contextlib import contextmanager
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from PyQt6 import QtWidgets, QtCore
+from PyQt6.QtCore import QObject, pyqtSlot, pyqtSignal
+import threading
+
+try:
+    import pytz
+    PYTZ_AVAILABLE = True
+except ImportError:
+    PYTZ_AVAILABLE = False
+
+from ..api import config as api_config
+from .secret_storage import (
+    transform_settings_secrets,
+    unprotect_settings_secrets,
+    settings_have_plaintext_secrets,
+    protect_secret,
+)
+
+SETTINGS_PROFILE_ENV = "GT_SETTINGS_PROFILE"
+SETTINGS_DIR_ENV = "GT_SETTINGS_DIR"
+DEFAULT_SETTINGS_DIRNAME = ".epub_translator"
+PROFILE_SETTINGS_DIRNAME = "profiles"
+_DEFAULT_PROFILE_ALIASES = {"", "default", "global", "main"}
+
+
+@contextmanager
+def _interprocess_file_lock(lock_path: str, timeout: float = 30.0):
+    """Serialize settings read/merge/write across application processes."""
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    with open(lock_path, "a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            deadline = time.monotonic() + timeout
+            while True:
+                lock_file.seek(0)
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out acquiring settings lock: {lock_path}")
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def normalize_settings_profile(profile) -> str:
+    raw_value = "" if profile is None else str(profile).strip()
+    if raw_value.lower() in _DEFAULT_PROFILE_ALIASES:
+        return ""
+    return raw_value
+
+
+def _safe_profile_segment(profile: str) -> str:
+    normalized = normalize_settings_profile(profile)
+    if not normalized:
+        return ""
+    safe = "".join(
+        char if char.isalnum() or char in ("-", "_") else "_"
+        for char in normalized
+    ).strip("._-")
+    return safe or "profile"
+
+
+def default_settings_dir(home_dir=None) -> str:
+    root = os.path.expanduser("~") if home_dir is None else os.path.expanduser(str(home_dir))
+    return os.path.abspath(os.path.join(root, DEFAULT_SETTINGS_DIRNAME))
+
+
+def resolve_settings_location(config_file=None, config_dir=None, profile=None, home_dir=None):
+    if config_file:
+        resolved_file = os.path.abspath(os.path.expanduser(str(config_file)))
+        return os.path.dirname(resolved_file), resolved_file, "", "explicit_file"
+
+    env_config_dir = os.environ.get(SETTINGS_DIR_ENV)
+    env_profile = os.environ.get(SETTINGS_PROFILE_ENV)
+    profile_name = normalize_settings_profile(profile if profile is not None else env_profile)
+
+    dir_override = config_dir if config_dir is not None else env_config_dir
+    if dir_override:
+        resolved_dir = os.path.abspath(os.path.expanduser(str(dir_override)))
+        return resolved_dir, os.path.join(resolved_dir, "settings.json"), profile_name, "custom_dir"
+
+    root_dir = default_settings_dir(home_dir=home_dir)
+    if profile_name:
+        resolved_dir = os.path.join(root_dir, PROFILE_SETTINGS_DIRNAME, _safe_profile_segment(profile_name))
+        return resolved_dir, os.path.join(resolved_dir, "settings.json"), profile_name, "profile"
+
+    return root_dir, os.path.join(root_dir, "settings.json"), "", "default"
+
+
+_MISSING = object()
+
+# Списки, которые надо сливать поэлементно, а не заменять целиком:
+# имя настройки -> поле, по которому опознаётся запись.
+_KEYED_LIST_SETTINGS = {"api_keys_with_status": "key"}
+
+
+def _index_entries_by(entries, id_field):
+    indexed = {}
+    for entry in entries or []:
+        if isinstance(entry, dict) and entry.get(id_field) is not None:
+            indexed[entry[id_field]] = entry
+    return indexed
+
+
+def _merge_keyed_list(base, ours, theirs, id_field):
+    """Наши записи авторитетны; чужие добавления подхватываем, наши удаления держим.
+
+    Чужое удаление записи, которая у нас ещё есть, намеренно игнорируется:
+    воскресить лишний ключ безопаснее, чем потерять рабочий.
+    """
+    base_ids = set(_index_entries_by(base, id_field))
+    our_ids = set(_index_entries_by(ours, id_field))
+
+    merged = list(ours or [])
+    for entry_id, entry in _index_entries_by(theirs, id_field).items():
+        if entry_id not in our_ids and entry_id not in base_ids:
+            merged.append(entry)
+    return merged
+
+
+def merge_settings_snapshots(base, ours, theirs):
+    """Трёхсторонняя склейка настроек для файла, который делят несколько процессов.
+
+    `base` — состояние диска на момент нашей последней синхронизации, `ours` — наш
+    кэш, `theirs` — то, что лежит на диске сейчас. Поле, которого мы не касались,
+    берём в их версии; наши правки и удаления сохраняем.
+    """
+    base = base or {}
+    ours = ours or {}
+    theirs = theirs or {}
+
+    merged = {}
+    for field in set(ours) | set(theirs):
+        our_value = ours.get(field, _MISSING)
+        their_value = theirs.get(field, _MISSING)
+        base_value = base.get(field, _MISSING)
+
+        id_field = _KEYED_LIST_SETTINGS.get(field)
+        if id_field and (isinstance(our_value, list) or isinstance(their_value, list)):
+            merged[field] = _merge_keyed_list(
+                base_value if isinstance(base_value, list) else [],
+                our_value if isinstance(our_value, list) else [],
+                their_value if isinstance(their_value, list) else [],
+                id_field,
+            )
+            continue
+
+        if our_value is _MISSING:
+            # Поля у нас нет. Если в базе оно было — это наше удаление, не воскрешаем.
+            if base_value is _MISSING:
+                merged[field] = their_value
+            continue
+
+        if their_value is not _MISSING and our_value == base_value:
+            merged[field] = their_value
+        else:
+            merged[field] = our_value
+
+    return merged
+
+
+def configure_settings_scope(*, profile=None, config_dir=None):
+    if config_dir:
+        os.environ[SETTINGS_DIR_ENV] = os.path.abspath(os.path.expanduser(str(config_dir)))
+        os.environ.pop(SETTINGS_PROFILE_ENV, None)
+        return
+
+    if profile is not None:
+        os.environ.pop(SETTINGS_DIR_ENV, None)
+        os.environ[SETTINGS_PROFILE_ENV] = str(profile).strip()
+
+
+# --- ПРЕДПОЛАГАЕМЫЙ ИМПОРТ, МОЖЕТ ПОТРЕБОВАТЬ КОРРЕКТИРОВКИ ---
+try:
+    # Попытка абсолютного импорта от корня (предпочтительно)
+    import os_patch
+    PatientLock = os_patch.PatientLock
+except (ImportError, AttributeError):
+    # Запасной вариант, если PatientLock не найден, используем RLock как менее строгое, но безопасное решение
+    print("[SettingsManager WARN] PatientLock не найден. Используется стандартный RLock.")
+    PatientLock = threading.RLock
+
+
+class SettingsManager(QObject):
+    _save_requested = pyqtSignal()
+    _request_count_changed = pyqtSignal(str, str, int)
+    def __init__(self, event_bus=None, config_file=None, config_dir=None, profile=None):
+        super().__init__()
+        
+        # --- Гибридный подход к получению зависимостей ---
+        app = QtWidgets.QApplication.instance()
+        self.bus = event_bus or getattr(app, 'event_bus', None)
+        if self.bus:
+            self.bus.event_posted.connect(self.on_event)
+        else:
+            print("[WARN] SettingsManager не получил event_bus и не нашел его в QApplication.")
+
+        # --- Гибкая логика для пути к файлу ---
+        (
+            self.config_dir,
+            self.config_file,
+            self.settings_profile,
+            self.settings_scope,
+        ) = resolve_settings_location(
+            config_file=config_file,
+            config_dir=config_dir,
+            profile=profile,
+        )
+        
+        self.ensure_config_dir()
+        
+        # --- КЛЮЧЕВЫЕ КОМПОНЕНТЫ КЭШИРУЮЩЕЙ АРХИТЕКТУРЫ ---
+        self.file_lock = PatientLock()
+        self._cache = {}
+        # Снимок диска на момент последней синхронизации. Нужен, чтобы при записи
+        # отличить наши правки от чужих и не затереть другой экземпляр приложения.
+        self._disk_baseline = {}
+        self._is_dirty = False
+        self._last_save_error = None
+        
+        # Таймер для отложенной записи (debouncing)
+        self._save_timer = QtCore.QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(2500) # Задержка в 2.5 секунды
+        self._save_timer.timeout.connect(self._perform_save)
+        self._save_requested.connect(self._schedule_save)
+        self._request_count_changed.connect(self._emit_request_count_updated)
+        # Первоначальная загрузка кэша
+        with self.file_lock:
+            self._load_from_disk_unsafe()
+
+        # Пока приложение открыто, своевременно снимаем истекшие ограничения
+        # и очищаем счетчики запросов, не дожидаясь перезапуска или ручного
+        # сохранения настроек.
+        self._limit_maintenance_timer = QtCore.QTimer(self)
+        self._limit_maintenance_timer.setInterval(5000)
+        self._limit_maintenance_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
+        self._limit_maintenance_timer.timeout.connect(
+            self._refresh_expired_key_limits)
+        if QtCore.QCoreApplication.instance() is not None:
+            self._limit_maintenance_timer.start()
+
+        # Гарантированное сохранение при выходе из приложения
+        if app:
+            app.aboutToQuit.connect(self.flush)
+
+    def _post_event(self, name: str, data: dict = None):
+        if not self.bus: return
+        event = {'event': name, 'source': 'SettingsManager', 'data': data or {}}
+        self.bus.event_posted.emit(event)
+
+    # --- ВНУТРЕННИЕ МЕТОДЫ УПРАВЛЕНИЯ КЭШЕМ И ФАЙЛОМ ---
+
+    def _load_from_disk_unsafe(self):
+        """[Под замком] Читает файл с диска и обновляет кэш."""
+        self._cache = self._load_unsafe()
+        had_plaintext_keys = getattr(self, "_loaded_plaintext_keys", False)
+        self._disk_baseline = deepcopy(self._cache)
+        self._migrate_keys_in_cache()
+        self._apply_custom_provider_models_to_runtime()
+        if had_plaintext_keys:
+            # Migrate existing plaintext settings immediately on Windows, rather
+            # than waiting for the next unrelated user change.
+            self._save_to_disk_unsafe()
+
+    def _save_to_disk_unsafe(self):
+        # The read/merge/write transaction must be protected as one unit; the
+        # in-memory PatientLock only coordinates threads in this process.
+        with _interprocess_file_lock(self.config_file + ".lock"):
+            self._save_to_disk_with_process_lock_unsafe()
+
+    def _save_to_disk_with_process_lock_unsafe(self):
+        """
+        [Под замком] Читает диск, объединяет статистику запросов и записывает.
+        Это предотвращает потерю данных о квотах при работе нескольких экземпляров.
+        """
+        # 1. Сначала пытаемся прочитать актуальное состояние файла
+        disk_data = self._load_unsafe()
+        
+        # 2. Если файл существует и валиден, подтягиваем из него чужие запросы
+        if disk_data:
+            self._merge_disk_timestamps(disk_data)
+
+        self._check_and_reset_limits_in_cache()
+        self._apply_custom_provider_models_to_runtime()
+
+        # 3. Если файл успел измениться со времени нашей последней синхронизации,
+        # значит, с ним работает ещё один экземпляр приложения. Сливаем его правки
+        # в свой кэш, иначе запись целиком затрёт всё, чего у нас нет: чужие ключи,
+        # папки проекта, состояние интерфейса.
+        if disk_data and disk_data != self._disk_baseline:
+            merged = merge_settings_snapshots(self._disk_baseline, self._cache, disk_data)
+            self._cache.clear()
+            self._cache.update(merged)
+            self._apply_custom_provider_models_to_runtime()
+
+        # 4. Записываем итоговый результат (наши настройки + общая история)
+        self._save_unsafe(self._cache)
+        self._disk_baseline = deepcopy(self._cache)
+        self._is_dirty = False
+
+    def _apply_custom_provider_models_to_runtime(self):
+        custom_provider_models = self._cache.get("custom_provider_models", {})
+        api_config.set_custom_provider_models(custom_provider_models)
+    
+    def _merge_disk_timestamps(self, disk_data):
+        """Вспомогательный метод: объединяет таймстампы из файла с текущим кэшем."""
+        disk_keys = disk_data.get('api_keys_with_status', [])
+        mem_keys = self._cache.get('api_keys_with_status', [])
+        
+        # Создаем карту для быстрого сопоставления ключей в памяти
+        mem_key_map = {k['key']: k for k in mem_keys}
+
+        for disk_k in disk_keys:
+            key_str = disk_k.get('key')
+            # Если такой ключ есть у нас в памяти
+            if key_str in mem_key_map:
+                mem_k = mem_key_map[key_str]
+                
+                disk_models = disk_k.get('status_by_model', {})
+                mem_models = mem_k.get('status_by_model', {})
+                
+                # Проходим по моделям внутри ключа
+                for model_id, disk_stats in disk_models.items():
+                    # Если модель есть и у нас, мержим списки
+                    if model_id in mem_models:
+                        disk_reqs = set(disk_stats.get('requests', []))
+                        mem_stats = mem_models[model_id]
+                        mem_reqs = set(mem_stats.get('requests', []))
+                        
+                        # Объединение множеств (исключает дубликаты)
+                        if not disk_reqs.issubset(mem_reqs):
+                            # Сортируем, чтобы хронология была красивой
+                            mem_stats['requests'] = sorted(list(mem_reqs | disk_reqs))
+                    
+                    # Если в памяти этой модели еще нет (например, использовалась в другом окне), 
+                    # можно теоретически добавить, но для безопасности лучше не трогать структуру кэша,
+                    # так как мы только "обогащаем" существующие данные.
+                    
+    def _request_save(self):
+        """
+        [Потокобезопасно] Помечает кэш как 'грязный' и ИСПУСКАЕТ СИГНАЛ
+        для запуска таймера в главном потоке.
+        """
+        self._is_dirty = True
+        # --- ИЗМЕНЕНИЕ: Вместо прямого вызова .start() испускаем сигнал ---
+        self._save_requested.emit()
+
+    @pyqtSlot()
+    def _perform_save(self):
+        """[Слот, GUI-поток] Если кэш 'грязный', атомарно сохраняет его на диск."""
+        save_error = None
+        if self._is_dirty:
+            with self.file_lock:
+                try:
+                    self._save_to_disk_unsafe()
+                    self._last_save_error = None
+                except OSError as e:
+                    self._last_save_error = e
+                    save_error = e
+
+        if save_error:
+            print(f"[SettingsManager ERROR] Автосохранение настроек не выполнено: {save_error}")
+            self._post_event('settings_save_failed', {
+                'message': str(save_error),
+                'errno': getattr(save_error, 'errno', None),
+                'filename': getattr(save_error, 'filename', None) or self.config_file,
+            })
+
+    @pyqtSlot()
+    def _schedule_save(self):
+        self._save_timer.start()
+
+    @pyqtSlot()
+    def _refresh_expired_key_limits(self):
+        """Снимает истекшие ограничения ключей и сразу уведомляет интерфейс."""
+        changed = False
+        with self.file_lock:
+            changed = self._check_and_reset_limits_in_cache()
+            if changed:
+                self._request_save()
+
+        if changed:
+            self._post_event(
+                'key_statuses_updated',
+                {'reason': 'automatic_limit_reset'},
+            )
+
+    @pyqtSlot()
+    def flush(self):
+        """[Слот, GUI-поток] Принудительно сохраняет кэш. Вызывается при выходе."""
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+        self._perform_save()
+
+    @pyqtSlot(str, str, int)
+    def _emit_request_count_updated(self, key_to_update, model_id, new_count):
+        self._post_event('request_count_updated', {
+            'key': key_to_update,
+            'model_id': model_id,
+            'count': new_count
+        })
+
+    def _migrate_keys_in_cache(self):
+        """[Под замком] Выполняет миграцию старого формата ключей прямо в кэше."""
+        migrated = False
+        key_statuses = self._cache.get('api_keys_with_status', [])
+        
+        for key_info in key_statuses:
+            if 'exhausted_at' in key_info or 'requests' in key_info:
+                if 'status_by_model' not in key_info: key_info['status_by_model'] = {}
+                provider_id = key_info.get('provider', 'gemini')
+                provider_cfg = api_config.api_providers_view().get(provider_id, {})
+                default_model_id = next(iter(provider_cfg.get('models', {}).values()), {}).get('id')
+                if default_model_id and default_model_id not in key_info['status_by_model']:
+                    key_info['status_by_model'][default_model_id] = {
+                        "exhausted_at": key_info.pop('exhausted_at', None),
+                        "exhausted_level": key_info.pop('exhausted_level', 0),
+                        "requests": key_info.pop('requests', [])
+                    }
+                    migrated = True
+        
+        if not key_statuses and 'api_keys' in self._cache:
+            old_keys = self._cache.pop('api_keys', [])
+            self._cache['api_keys_with_status'] = [{"key": key, "provider": "gemini", "status_by_model": {}} for key in old_keys]
+            migrated = True
+            
+        if migrated:
+            print("[SettingsManager] Обнаружен и мигрирован старый формат хранения ключей.")
+            self._save_to_disk_unsafe()
+
+    # --- ПУБЛИЧНЫЕ МЕТОДЫ: Адаптированы для работы с кэшем ---
+
+    def load_settings(self):
+        with self.file_lock:
+            return self._cache.copy()
+
+    def save_settings(self, settings_dict):
+        with self.file_lock:
+            self._cache = settings_dict
+            self._save_to_disk_unsafe()
+        return True
+
+    @pyqtSlot(dict)
+    def on_event(self, event_data: dict):
+        event_name = event_data.get('event')
+        data = event_data.get('data', {})
+        if event_name == 'fatal_error':
+            payload = data.get('payload', {})
+            if payload.get('type') == 'quota_exceeded':
+                source = event_data.get('source', '')
+                if source.startswith('worker_'):
+                    key = event_data.get('worker_key', '')
+                    model_id = payload.get('model_id') 
+                    if key and model_id:
+                        self.mark_key_as_exhausted(key, model_id)
+            elif payload.get('type') == 'invalid_key':
+                source = event_data.get('source', '')
+                key = event_data.get('worker_key', '')
+                if source.startswith('worker_') and key:
+                    self.mark_api_key_invalid(key)
+
+    def ensure_config_dir(self):
+        if not os.path.exists(self.config_dir):
+            os.makedirs(self.config_dir, exist_ok=True)
+
+    def _get_status_for_model(self, key_info, model_id):
+        if 'status_by_model' not in key_info:
+            key_info['status_by_model'] = {}
+        if model_id not in key_info['status_by_model']:
+            key_info['status_by_model'][model_id] = {"exhausted_at": None, "exhausted_level": 0, "requests": []}
+        return key_info['status_by_model'][model_id]
+
+    def is_key_limit_active(self, key_info, model_id):
+        if bool(key_info.get('api_key_invalid')):
+            return True
+        if not model_id: return False
+        model_status = self._get_status_for_model(key_info, model_id)
+        timestamp = model_status.get("exhausted_at")
+        level = model_status.get("exhausted_level", 0)
+        if not timestamp or level < 2: return False
+        provider = key_info.get("provider", "default")
+        policy = api_config.api_providers_view().get(provider, {}).get('reset_policy', api_config.default_reset_policy())
+        exhausted_time_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        if policy["type"] == "rolling":
+            return now_utc < exhausted_time_utc + timedelta(hours=policy["duration_hours"])
+        elif policy["type"] == "daily" and PYTZ_AVAILABLE:
+            try:
+                tz = pytz.timezone(policy["timezone"])
+                now_in_tz = now_utc.astimezone(tz)
+                last_reset = now_in_tz.replace(hour=policy.get("reset_hour",0), minute=policy.get("reset_minute",1), second=0, microsecond=0)
+                if last_reset > now_in_tz: last_reset -= timedelta(days=1)
+                return exhausted_time_utc.astimezone(tz) > last_reset
+            except Exception: return now_utc < exhausted_time_utc + timedelta(hours=24)
+        else: return now_utc < exhausted_time_utc + timedelta(hours=24)
+    
+    def get_key_info(self, key_to_find):
+        with self.file_lock:
+            for key_info in self._cache.get('api_keys_with_status', []):
+                if key_info['key'] == key_to_find:
+                    return key_info.copy()
+        return None
+
+    def get_key_reset_time_str(self, key_info, model_id):
+        if not model_id: return "Модель не выбрана"
+        model_status = self._get_status_for_model(key_info, model_id)
+        timestamp = model_status.get("exhausted_at")
+        if not timestamp: return "Активен"
+        provider = key_info.get("provider", "default")
+        policy = api_config.api_providers_view().get(provider, {}).get('reset_policy', api_config.default_reset_policy())
+        exhausted_time_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        reset_time_utc = None
+        if policy["type"] == "rolling":
+            reset_time_utc = exhausted_time_utc + timedelta(hours=policy["duration_hours"])
+        elif policy["type"] == "daily" and PYTZ_AVAILABLE:
+            try:
+                tz = pytz.timezone(policy["timezone"])
+                now_in_tz = datetime.now(tz)
+                next_reset_in_tz = now_in_tz.replace(hour=policy.get("reset_hour", 0), minute=policy.get("reset_minute", 1), second=0, microsecond=0)
+                if next_reset_in_tz <= now_in_tz: next_reset_in_tz += timedelta(days=1)
+                reset_time_utc = next_reset_in_tz.astimezone(timezone.utc)
+            except Exception as e:
+                print(f"[ERROR] Ошибка расчета времени для ключа (daily policy): {e}")
+                reset_time_utc = exhausted_time_utc + timedelta(hours=24)
+        else:
+            reset_time_utc = exhausted_time_utc + timedelta(hours=24)
+        if reset_time_utc:
+            local_reset_time = reset_time_utc.astimezone()
+            return f"Сброс ~{local_reset_time.strftime('%H:%M (%d.%m)')}"
+        return "Сброс в течение 24ч"
+
+    def _get_request_policy(self, key_info):
+        provider = key_info.get("provider", "default")
+        return api_config.api_providers_view().get(provider, {}).get('reset_policy', api_config.default_reset_policy())
+
+    def _filter_request_timestamps_in_window(self, timestamps, policy, now_ts=None):
+        if not timestamps:
+            return []
+
+        if now_ts is None:
+            now_ts = int(time.time())
+
+        normalized_timestamps = [int(ts) for ts in timestamps if isinstance(ts, (int, float))]
+        if not normalized_timestamps:
+            return []
+
+        if policy['type'] == 'rolling':
+            cutoff = now_ts - (int(policy.get('duration_hours', 24)) * 3600)
+            return sorted(ts for ts in normalized_timestamps if ts > cutoff)
+
+        if policy['type'] == 'daily' and PYTZ_AVAILABLE:
+            try:
+                tz = pytz.timezone(policy["timezone"])
+                now_in_tz = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(tz)
+                last_reset = now_in_tz.replace(
+                    hour=policy.get("reset_hour", 0),
+                    minute=policy.get("reset_minute", 1),
+                    second=0,
+                    microsecond=0,
+                )
+                if last_reset > now_in_tz:
+                    last_reset -= timedelta(days=1)
+                cutoff = int(last_reset.timestamp())
+                return sorted(ts for ts in normalized_timestamps if ts > cutoff)
+            except Exception:
+                pass
+
+        cutoff = now_ts - (24 * 3600)
+        return sorted(ts for ts in normalized_timestamps if ts > cutoff)
+
+    def _prune_request_history_for_model(self, key_info, model_id, now_ts=None):
+        model_status = self._get_status_for_model(key_info, model_id)
+        current_requests = model_status.get('requests', [])
+        filtered_requests = self._filter_request_timestamps_in_window(
+            current_requests,
+            self._get_request_policy(key_info),
+            now_ts=now_ts,
+        )
+        was_changed = filtered_requests != current_requests
+        if was_changed:
+            model_status['requests'] = filtered_requests
+        return filtered_requests, was_changed
+
+    def increment_request_count(self, key_to_update, model_id):
+        if not model_id: return False
+        new_count = 0
+        updated = False
+        with self.file_lock:
+            now = int(time.time())
+            for key_info in self._cache.get('api_keys_with_status', []):
+                if key_info['key'] == key_to_update:
+                    model_status = self._get_status_for_model(key_info, model_id)
+                    model_status['requests'].append(now)
+                    valid_requests, _ = self._prune_request_history_for_model(
+                        key_info, model_id, now_ts=now)
+                    new_count = len(valid_requests)
+                    updated = True
+                    break
+            if updated:
+                self._request_save()
+        # print(f"key_to_update {key_to_update} model_id {model_id} new_count {new_count}")
+        if updated:
+            self._request_count_changed.emit(key_to_update, model_id, new_count)
+        return updated
+
+    def decrement_request_count(self, key_to_update, model_id):
+        if not model_id: return False
+        new_count = 0
+        updated = False
+        with self.file_lock:
+            for key_info in self._cache.get('api_keys_with_status', []):
+                if key_info['key'] == key_to_update:
+                    valid_requests, was_pruned = self._prune_request_history_for_model(
+                        key_info, model_id)
+                    if valid_requests:
+                        valid_requests.pop()
+                        self._get_status_for_model(key_info, model_id)['requests'] = valid_requests
+                        was_pruned = True
+                    new_count = len(valid_requests)
+                    updated = was_pruned
+                    break
+            if updated:
+                self._request_save()
+        # print(f"key_to_update {key_to_update} model_id {model_id} new_count {new_count}")
+        if updated:
+            self._request_count_changed.emit(key_to_update, model_id, new_count)
+        return updated
+
+    def load_key_statuses(self):
+        with self.file_lock:
+            if self._check_and_reset_limits_in_cache():
+                self._save_to_disk_unsafe() # Сохраняем, если были изменения
+            return self._cache.get('api_keys_with_status', []).copy()
+
+    def save_key_statuses(self, key_statuses):
+        with self.file_lock:
+            self._cache['api_keys_with_status'] = key_statuses
+            if 'api_keys' in self._cache:
+                del self._cache['api_keys']
+            self._save_to_disk_unsafe()
+        self._post_event('key_statuses_updated')
+        return True
+
+    def remove_keys_atomically(self, keys_to_remove: set):
+        removed_count = -1
+        with self.file_lock: 
+            key_statuses = self._cache.get('api_keys_with_status', [])
+            initial_count = len(key_statuses)
+            updated_statuses = [ki for ki in key_statuses if ki['key'] not in keys_to_remove]
+            removed_count = initial_count - len(updated_statuses)
+            if removed_count > 0:
+                self._cache['api_keys_with_status'] = updated_statuses
+                self._save_to_disk_unsafe()
+        if removed_count > 0:
+            self._post_event('key_statuses_updated')
+        return removed_count
+    
+    def mark_key_as_exhausted(self, key_to_mark, model_id):
+        """
+        [Потокобезопасно] Помечает ключ как исчерпанный для конкретной модели.
+        Адаптировано для работы с in-memory кэшем.
+        """
+        if not model_id: return False
+        
+        updated = False
+        with self.file_lock:
+            # Итерируемся прямо по списку в кэше
+            for key_info in self._cache.get('api_keys_with_status', []):
+                if key_info['key'] == key_to_mark:
+                    model_status = self._get_status_for_model(key_info, model_id)
+                    model_status['exhausted_at'] = time.time()
+                    model_status['exhausted_level'] = 2
+                    updated = True
+                    break
+            
+            if updated:
+                # Используем механизм отложенного сохранения, чтобы не фризить GUI при ошибке
+                self._request_save()
+
+        # Уведомление отправляем вне блокировки
+        if updated:
+            self._post_event('key_statuses_updated')
+            
+        return updated
+
+    def mark_api_key_invalid(self, key_to_mark):
+        """Quarantine a credential rejected by authentication, until revalidated."""
+        key_to_mark = str(key_to_mark or '').strip()
+        if not key_to_mark:
+            return False
+        updated = False
+        with self.file_lock:
+            for key_info in self._cache.get('api_keys_with_status', []):
+                if key_info.get('key') == key_to_mark:
+                    if not key_info.get('api_key_invalid'):
+                        key_info['api_key_invalid'] = True
+                        key_info['api_key_invalid_reason'] = 'authentication_rejected'
+                        key_info['api_key_invalid_at'] = time.time()
+                        updated = True
+                    break
+            if updated:
+                self._request_save()
+        if updated:
+            self._post_event('key_statuses_updated')
+        return updated
+        
+    def add_keys_atomically(self, new_keys: set, provider_id: str):
+        added_count = -1
+        with self.file_lock:
+            key_statuses = self._cache.get('api_keys_with_status', [])
+            existing_keys = {ki['key'] for ki in key_statuses}
+            added_count_internal = 0
+            for key in new_keys:
+                if key not in existing_keys:
+                    key_statuses.append({"key": key, "provider": provider_id, "status_by_model": {}})
+                    added_count_internal += 1
+            if added_count_internal > 0:
+                self._cache['api_keys_with_status'] = key_statuses
+                self._save_to_disk_unsafe()
+                added_count = added_count_internal
+            else:
+                added_count = 0
+        if added_count > 0:
+            self._post_event('key_statuses_updated')
+        return added_count
+                
+    def get_api_keys(self):
+        with self.file_lock:
+            return [item['key'] for item in self._cache.get('api_keys_with_status', [])]
+
+    def save_api_keys(self, keys_list):
+        key_statuses = [{"key": key, "provider": "gemini", "status_by_model": {}} for key in keys_list]
+        return self.save_key_statuses(key_statuses)
+
+    def save_ui_state(self, ui_state_dict):
+        with self.file_lock:
+            self._cache.update(ui_state_dict)
+            self._save_to_disk_unsafe()
+        return True
+            
+    # --- ОСТАЛЬНЫЕ МЕТОДЫ, РАБОТАЮЩИЕ С КЭШЕМ ---
+    def _generic_loader(self, key, default=None):
+        with self.file_lock: return self._cache.get(key, default)
+    def _generic_saver(self, key, value):
+        with self.file_lock:
+            self._cache[key] = value
+            self._save_to_disk_unsafe()
+        return True
+    
+    def _check_and_reset_limits_in_cache(self):
+        """[Под замком] Проверяет и сбрасывает лимиты прямо в кэше."""
+        changed = False
+        # Работаем с кэшем напрямую, так как мы под замком
+        for key_info in self._cache.get('api_keys_with_status', []):
+            if 'status_by_model' in key_info:
+                # list() для создания копии, чтобы избежать ошибки изменения размера во время итерации
+                for model_id in list(key_info['status_by_model'].keys()):
+                    _, was_pruned = self._prune_request_history_for_model(key_info, model_id)
+                    if was_pruned:
+                        changed = True
+                    # ВЫЗЫВАЕМ МЕТОД У SELF, А НЕ У SELF.SETTINGS_MANAGER
+                    if not self.is_key_limit_active(key_info, model_id):
+                        # Проверяем, есть ли что сбрасывать
+                        if key_info['status_by_model'][model_id].get("exhausted_at") is not None:
+                            changed = True
+                            key_info['status_by_model'][model_id]["exhausted_at"] = None
+                            key_info['status_by_model'][model_id]["exhausted_level"] = 0
+        return changed
+    
+    def get_custom_prompt(self): return self._generic_loader('custom_prompt', '')
+    def save_custom_prompt(self, prompt): return self._generic_saver('custom_prompt', prompt)
+    def get_custom_provider_models(self):
+        with self.file_lock:
+            return deepcopy(self._cache.get("custom_provider_models", {}))
+
+    def save_custom_provider_models(self, custom_provider_models):
+        normalized = api_config.set_custom_provider_models(custom_provider_models)
+        with self.file_lock:
+            self._cache["custom_provider_models"] = deepcopy(normalized)
+            self._save_to_disk_unsafe()
+        return True
+
+    def add_custom_provider_model(self, provider_id, display_name, model_config):
+        with self.file_lock:
+            custom_models = deepcopy(self._cache.get("custom_provider_models", {}))
+            provider_key = str(provider_id or "").strip()
+            model_name = str(display_name or "").strip()
+            if not provider_key or not model_name:
+                return False
+            provider_models = custom_models.setdefault(provider_key, {})
+            provider_models[model_name] = deepcopy(model_config or {})
+            self._cache["custom_provider_models"] = api_config.set_custom_provider_models(custom_models)
+            self._save_to_disk_unsafe()
+        return True
+
+    def get_last_settings(self):
+        with self.file_lock:
+            return {
+                'output_folder': self._cache.get('last_output_folder', ''),
+                'model': self._cache.get('last_model', api_config.default_model_name()),
+                'temperature': self._cache.get('last_temperature', 1.0),
+                'temperature_override_enabled': self._cache.get('last_temperature_override_enabled', False),
+                'rpm_limit': self._cache.get('last_concurrent_requests', 10),
+                'chunking': self._cache.get('last_chunking', False),
+                'dynamic_glossary': self._cache.get('last_dynamic_glossary', True),
+                'system_instruction': self._cache.get('last_system_instruction', False),
+                'thinking_enabled': self._cache.get('last_thinking_enabled', False),
+                'thinking_budget': self._cache.get('last_thinking_budget', -1),
+                'use_json_epub_pipeline': self._cache.get('last_use_json_epub_pipeline', False),
+            }
+    def save_last_settings(self, **kwargs):
+        with self.file_lock:
+            for key, value in kwargs.items():
+                self._cache[f'last_{key}'] = value
+            self._save_to_disk_unsafe()
+        return True
+        
+    def clear_key_exhaustion_status(self, key_to_clear, model_id):
+        if not model_id: return False
+        was_cleared = False
+        with self.file_lock:
+            for key_info in self._cache.get('api_keys_with_status', []):
+                if key_info['key'] == key_to_clear:
+                    model_status = self._get_status_for_model(key_info, model_id)
+                    if key_info.get('api_key_invalid'):
+                        key_info.pop('api_key_invalid', None)
+                        key_info.pop('api_key_invalid_reason', None)
+                        key_info.pop('api_key_invalid_at', None)
+                        was_cleared = True
+                    if model_status.get("exhausted_at") is not None:
+                        model_status["exhausted_at"] = None
+                        model_status["exhausted_level"] = 0
+                        was_cleared = True
+                    break
+            if was_cleared:
+                self._save_to_disk_unsafe()
+        if was_cleared:
+            self._post_event('key_statuses_updated')
+        return was_cleared
+        
+    def _normalize_project_path(self, path):
+        return os.path.normpath(path) if path else ''
+
+    def _directory_if_exists(self, path):
+        normalized_path = self._normalize_project_path(path)
+        return normalized_path if normalized_path and os.path.isdir(normalized_path) else ''
+
+    def get_project_start_folder(self, *candidates, fallback_to_last_project=True):
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if os.path.isfile(candidate):
+                candidate = os.path.dirname(candidate)
+            valid_candidate = self._directory_if_exists(candidate)
+            if valid_candidate:
+                return valid_candidate
+
+        root_folder = self.get_last_projects_root_folder()
+        valid_root = self._directory_if_exists(root_folder)
+        if valid_root:
+            return valid_root
+
+        if fallback_to_last_project:
+            last_project_folder = self.get_last_project_folder()
+            valid_last_project = self._directory_if_exists(last_project_folder)
+            if valid_last_project:
+                return valid_last_project
+
+        return os.path.expanduser("~")
+
+    def _project_history_key(self, output_folder='', epub_path=''):
+        path = output_folder or epub_path
+        return os.path.normcase(self._normalize_project_path(path))
+
+    def _prepare_project_history(self, history_list):
+        prepared_history = []
+        seen_keys = set()
+
+        for project in history_list or []:
+            if not isinstance(project, dict):
+                continue
+
+            normalized_project = dict(project)
+            normalized_project['epub_path'] = self._normalize_project_path(
+                normalized_project.get('epub_path')
+            )
+            normalized_project['output_folder'] = self._normalize_project_path(
+                normalized_project.get('output_folder')
+            )
+
+            project_key = self._project_history_key(
+                normalized_project.get('output_folder'),
+                normalized_project.get('epub_path'),
+            )
+            if not project_key or project_key in seen_keys:
+                continue
+
+            seen_keys.add(project_key)
+            prepared_history.append(normalized_project)
+
+        return prepared_history[:30]
+
+    def load_project_history(self):
+        with self.file_lock:
+            history = self._prepare_project_history(self._cache.get('project_history', []))
+            if history != self._cache.get('project_history', []):
+                self._cache['project_history'] = history
+                self._save_to_disk_unsafe()
+            return history.copy()
+
+    def save_project_history(self, history_list):
+        return self._generic_saver('project_history', self._prepare_project_history(history_list))
+    def get_last_project_folder(self): return self._generic_loader('last_project_folder', '')
+    def save_last_project_folder(self, folder_path): return self._generic_saver('last_project_folder', folder_path or '')
+    def get_last_projects_root_folder(self):
+        with self.file_lock:
+            return self._normalize_project_path(self._cache.get('last_projects_root_folder', ''))
+    def save_last_projects_root_folder(self, folder_path): return self._generic_saver('last_projects_root_folder', folder_path or '')
+
+    def add_to_project_history(self, epub_path, output_folder):
+        normalized_epub_path = self._normalize_project_path(epub_path)
+        normalized_output_folder = self._normalize_project_path(output_folder)
+        if not normalized_epub_path or not normalized_output_folder:
+            return
+
+        with self.file_lock:
+            history = self._prepare_project_history(self._cache.get('project_history', []))
+            output_folder_key = self._project_history_key(normalized_output_folder)
+            project_to_move = next(
+                (
+                    p for p in history
+                    if self._project_history_key(
+                        p.get('output_folder'),
+                        p.get('epub_path'),
+                    ) == output_folder_key
+                ),
+                None
+            )
+            if project_to_move:
+                history.remove(project_to_move)
+                new_project_entry = project_to_move
+                epub_name = os.path.splitext(os.path.basename(normalized_epub_path))[0]
+                folder_name = os.path.basename(os.path.normpath(normalized_output_folder))
+                new_project_entry['name'] = f"{epub_name} - {folder_name}"
+                new_project_entry['epub_path'] = normalized_epub_path
+                new_project_entry['output_folder'] = normalized_output_folder
+            else:
+                epub_name = os.path.splitext(os.path.basename(normalized_epub_path))[0]
+                folder_name = os.path.basename(os.path.normpath(normalized_output_folder))
+                project_name = f"{epub_name} - {folder_name}"
+                new_project_entry = {
+                    "name": project_name,
+                    "epub_path": normalized_epub_path,
+                    "output_folder": normalized_output_folder,
+                }
+            history.insert(0, new_project_entry)
+            self._cache['project_history'] = self._prepare_project_history(history)
+            self._cache['last_project_folder'] = normalized_output_folder
+            self._save_to_disk_unsafe()
+
+    def get_request_count(self, key_info, model_id):
+        provider_id = key_info.get("provider", "default")
+        provider_config = api_config.api_providers_view().get(provider_id, {})
+        use_shared_counter = provider_config.get("shared_request_counter", False)
+        policy = provider_config.get('reset_policy', api_config.default_reset_policy())
+        if not use_shared_counter:
+            if not model_id: return 0
+            model_status = self._get_status_for_model(key_info, model_id)
+            timestamps = model_status.get('requests', [])
+            return self._count_valid_requests_in_window(timestamps, policy)
+        else:
+            total_count = 0
+            provider_model_ids = { model_data['id'] for model_data in provider_config.get('models', {}).values() }
+            for model_id_in_key, model_status in key_info.get('status_by_model', {}).items():
+                if model_id_in_key in provider_model_ids:
+                    timestamps = model_status.get('requests', [])
+                    total_count += self._count_valid_requests_in_window(timestamps, policy)
+            return total_count
+
+    def get_request_timestamps(self, key_info, model_id):
+        if not model_id: return []
+        model_status = self._get_status_for_model(key_info, model_id)
+        return self._filter_request_timestamps_in_window(
+            model_status.get('requests', []),
+            self._get_request_policy(key_info),
+        )
+    
+    def _count_valid_requests_in_window(self, timestamps, policy):
+        return len(self._filter_request_timestamps_in_window(timestamps, policy))
+
+    def _get_path_for_preset_type(self, preset_type: str) -> str:
+        """Вспомогательный метод для получения пути к файлу пресетов."""
+        filename_map = {
+            "prompt": "prompts.json", "glossary": "glossary_prompts.json",
+            "correction": "correction_prompts.json", "untranslated": "untranslated_prompts.json",
+            "manual_translation": "manual_translation_prompts.json",
+            "system": "system_prompts.json", "exceptions": "word_exceptions.json",
+            "auto_translation": "auto_translation_presets.json",
+            "glossary_pipeline": "glossary_pipeline_templates.json",
+        }
+        filename = filename_map.get(preset_type, "prompts.json")
+        return os.path.join(self.config_dir, filename)
+
+    def load_presets_by_type(self, preset_type: str):
+        path = self._get_path_for_preset_type(preset_type)
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f: return json.load(f)
+            except (json.JSONDecodeError, IOError): return {}
+        return {}
+    
+    def save_presets_by_type(self, preset_type: str, presets_dict: dict):
+        path = self._get_path_for_preset_type(preset_type)
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(presets_dict, f, ensure_ascii=False, indent=2, sort_keys=True)
+            return True
+        except IOError: return False
+
+    def load_named_prompts(self): return self.load_presets_by_type('prompt')
+    def save_named_prompts(self, d): return self.save_presets_by_type('prompt', d)
+    def load_glossary_prompts(self): return self.load_presets_by_type('glossary')
+    def save_glossary_prompts(self, d): return self.save_presets_by_type('glossary', d)
+    def load_correction_prompts(self): return self.load_presets_by_type('correction')
+    def save_correction_prompts(self, d): return self.save_presets_by_type('correction', d)
+    def load_untranslated_prompts(self): return self.load_presets_by_type('untranslated')
+    def save_untranslated_prompts(self, d): return self.save_presets_by_type('untranslated', d)
+    def load_manual_translation_prompts(self): return self.load_presets_by_type('manual_translation')
+    def save_manual_translation_prompts(self, d): return self.save_presets_by_type('manual_translation', d)
+    def load_system_prompts(self): return self.load_presets_by_type('system')
+    def save_system_prompts(self, d): return self.save_presets_by_type('system', d)
+    def load_word_exceptions_presets(self): return self.load_presets_by_type('exceptions')
+    def save_word_exceptions_presets(self, d): return self.save_presets_by_type('exceptions', d)
+    def load_auto_translation_presets(self): return self.load_presets_by_type('auto_translation')
+    def save_auto_translation_presets(self, d): return self.save_presets_by_type('auto_translation', d)
+    def load_glossary_pipeline_templates(self): return self.load_presets_by_type('glossary_pipeline')
+    def save_glossary_pipeline_templates(self, d): return self.save_presets_by_type('glossary_pipeline', d)
+    
+    def get_last_prompt_preset_name(self): return self._generic_loader('last_prompt_preset', None)
+    def save_last_prompt_preset_name(self, name): return self._generic_saver('last_prompt_preset', name)
+    def get_last_glossary_prompt_text(self): return self._generic_loader('last_glossary_prompt_text', api_config.default_glossary_prompt())
+    def save_last_glossary_prompt_text(self, text): return self._generic_saver('last_glossary_prompt_text', text)
+    def get_last_glossary_prompt_preset_name(self): return self._generic_loader('last_glossary_prompt_preset', None)
+    def save_last_glossary_prompt_preset_name(self, name): return self._generic_saver('last_glossary_prompt_preset', name)
+    def get_last_word_exceptions_text(self): return self._generic_loader('last_word_exceptions_text', "")
+    def save_last_word_exceptions_text(self, text): return self._generic_saver('last_word_exceptions_text', text)
+    def load_proxy_settings(self): return self._generic_loader("proxy_settings", {})
+    def get_last_correction_prompt_text(self): return self._generic_loader('last_correction_prompt_text', api_config.default_correction_prompt())
+    def save_last_correction_prompt_text(self, text): return self._generic_saver('last_correction_prompt_text', text)
+    def get_last_correction_prompt_preset_name(self): return self._generic_loader('last_correction_prompt_preset', None)
+    def save_last_correction_prompt_preset_name(self, name): return self._generic_saver('last_correction_prompt_preset', name)
+    def get_last_untranslated_prompt_text(self): return self._generic_loader('last_untranslated_prompt_text', api_config.default_untranslated_prompt())
+    def save_last_untranslated_prompt_text(self, text): return self._generic_saver('last_untranslated_prompt_text', text)
+    def get_last_untranslated_prompt_preset_name(self): return self._generic_loader('last_untranslated_prompt_preset', None)
+    def save_last_untranslated_prompt_preset_name(self, name): return self._generic_saver('last_untranslated_prompt_preset', name)
+    def get_last_manual_translation_prompt_text(self): return self._generic_loader('last_manual_translation_prompt_text', api_config.default_manual_translation_prompt())
+    def save_last_manual_translation_prompt_text(self, text): return self._generic_saver('last_manual_translation_prompt_text', text)
+    def get_last_manual_translation_prompt_preset_name(self): return self._generic_loader('last_manual_translation_prompt_preset', None)
+    def save_last_manual_translation_prompt_preset_name(self, name): return self._generic_saver('last_manual_translation_prompt_preset', name)
+    def get_last_system_prompt_text(self): return self._generic_loader('last_system_prompt_text', "")
+    def save_last_system_prompt_text(self, text): return self._generic_saver('last_system_prompt_text', text)
+    def get_last_system_prompt_preset_name(self): return self._generic_loader('last_system_prompt_preset', None)
+    def save_last_system_prompt_preset_name(self, name): return self._generic_saver('last_system_prompt_preset', name)
+    def get_last_auto_translation_preset_name(self): return self._generic_loader('last_auto_translation_preset', None)
+    def save_last_auto_translation_preset_name(self, name): return self._generic_saver('last_auto_translation_preset', name)
+    def get_last_glossary_pipeline_template_name(self): return self._generic_loader('last_glossary_pipeline_template', None)
+    def save_last_glossary_pipeline_template_name(self, name): return self._generic_saver('last_glossary_pipeline_template', name)
+    def get_last_auto_translation_settings(self): return self._generic_loader('last_auto_translation_settings', {})
+    def save_last_auto_translation_settings(self, settings_dict): return self._generic_saver('last_auto_translation_settings', settings_dict or {})
+    def get_last_glossary_generation_settings(self):
+        settings = self._generic_loader('last_glossary_generation_settings', {})
+        return settings.copy() if isinstance(settings, dict) else {}
+    def save_last_glossary_generation_settings(self, settings_dict): return self._generic_saver('last_glossary_generation_settings', settings_dict or {})
+    def get_ai_correction_review_settings(self): return self._generic_loader('ai_correction_review_settings', {})
+    def save_ai_correction_review_settings(self, settings_dict): return self._generic_saver('ai_correction_review_settings', settings_dict or {})
+    def get_last_validation_filter_settings(self):
+        settings = self._generic_loader('last_validation_filter_settings', {})
+        return settings.copy() if isinstance(settings, dict) else {}
+    def save_last_validation_filter_settings(self, settings_dict):
+        return self._generic_saver('last_validation_filter_settings', settings_dict or {})
+
+    def get_qa_settings(self):
+        """Load normalized translation quality settings with safe defaults."""
+        from ..qa.settings import SETTINGS_KEY, QaSettings
+
+        with self.file_lock:
+            payload = deepcopy(self._cache.get(SETTINGS_KEY))
+        return QaSettings.from_dict(payload)
+
+    def save_qa_settings(self, qa_settings) -> bool:
+        """Persist translation quality settings after normalizing their values."""
+        from ..qa.settings import SETTINGS_KEY, QaSettings
+
+        if not isinstance(qa_settings, QaSettings):
+            qa_settings = QaSettings.from_dict(qa_settings)
+        return self._generic_saver(SETTINGS_KEY, qa_settings.to_dict())
+    
+    def save_proxy_settings(self, proxy_settings_dict):
+        with self.file_lock:
+            self._cache["proxy_settings"] = proxy_settings_dict
+            # Настройки прокси лучше сохранить сразу (unsafe запись), чтобы они точно применились
+            self._save_to_disk_unsafe()
+        
+        # Важно: отправляем событие, на которое реагирует сетевой менеджер
+        self._post_event('proxy_settings_changed', proxy_settings_dict)
+        return True
+    
+    def load_full_session_settings(self):
+        return self._generic_loader('last_full_session', {})
+
+    def save_full_session_settings(self, session_dict):
+        return self._generic_saver('last_full_session', session_dict)
+        
+    def _save_unsafe(self, data_to_save):
+        """
+        Сохраняет настройки. 
+        1. Санитизирует ключи (предотвращает ошибку сортировки NoneType).
+        2. Генерирует JSON в памяти (быстро, проверка ошибок до записи).
+        3. Пишет во временный файл и делает атомарную подмену.
+        """
+        
+        # --- 1. Санитизация (лечим ошибку '<' not supported) ---
+        def sanitize_keys(data):
+            if isinstance(data, dict):
+                # Превращаем ключи в строки, рекурсивно идем вглубь
+                return {str(k): sanitize_keys(v) for k, v in data.items()}
+            elif isinstance(data, list):
+                return [sanitize_keys(i) for i in data]
+            else:
+                return data
+
+        try:
+            safe_data = sanitize_keys(data_to_save)
+        except Exception as e:
+            print(f"[SettingsManager] Ошибка санитизации: {e}")
+            safe_data = data_to_save
+
+        # --- 2. Генерация в памяти (RAM) ---
+        try:
+            # Формируем весь JSON-строку в оперативной памяти.
+            # Если тут будет ошибка (как ваша TypeError), она вылетит СЕЙЧАС,
+            # и мы даже не притронемся к файлу на диске. Файл будет спасен.
+            persisted_data = transform_settings_secrets(safe_data, protect_secret)
+            json_content = json.dumps(persisted_data, ensure_ascii=False, indent=2, sort_keys=True)
+        except Exception as e:
+            print(f"[SettingsManager CRITICAL] Ошибка генерации JSON: {e}")
+            # Не пишем ничего, чтобы не испортить файл
+            raise e
+
+        os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+        
+        # --- 3. Атомарная запись (Disk) ---
+        # Пишем во временный файл, который находится в ТОЙ ЖЕ папке.
+        # Это обязательно для работы os.replace (атомарного переноса).
+        config_dir = os.path.dirname(os.path.abspath(self.config_file))
+        prefix = f".{os.path.basename(self.config_file)}."
+        fd, temp_file = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=config_dir)
+        try:
+            # Записываем подготовленную строку
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(json_content)
+                f.flush()
+                os.fsync(f.fileno()) # Принудительно сбрасываем буфер ОС на диск
+
+            # МОМЕНТ ИСТИНЫ: Мгновенная подмена. 
+            # Либо старый файл, либо новый. Никаких промежуточных состояний.
+            os.replace(temp_file, self.config_file)
+
+        except Exception as e:
+            # Если что-то пошло не так (место на диске кончилось), удаляем мусор
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
+            print(f"[SettingsManager CRITICAL] Не удалось записать файл настроек: {e}")
+            raise e
+    
+    def _load_unsafe(self):
+        self._loaded_plaintext_keys = False
+        if not os.path.exists(self.config_file): return {}
+        encodings_to_try = ['utf-8', 'cp1251', 'cp866']
+        for encoding in encodings_to_try:
+            try:
+                with open(self.config_file, 'r', encoding=encoding) as f: content = f.read()
+                if not content.strip(): return {}
+                data_to_load = json.loads(content)
+                if isinstance(data_to_load, dict):
+                    self._loaded_plaintext_keys = settings_have_plaintext_secrets(data_to_load)
+                    data_to_load = unprotect_settings_secrets(data_to_load)
+                if encoding != 'utf-8':
+                    print(f"[SettingsManager] ВНИМАНИЕ: Файл настроек загружен из кодировки {encoding}; он будет записан в UTF-8 при следующем сохранении.")
+                return data_to_load
+            except (UnicodeDecodeError, json.JSONDecodeError): continue
+            except Exception as e:
+                print(f"[SettingsManager WARN] Не удалось прочитать файл настроек с кодировкой {encoding}: {e}")
+                continue
+        print(f"[SettingsManager CRITICAL] Не удалось прочитать или распарсить файл {self.config_file}. Файл может быть поврежден. Возвращаю пустые настройки.")
+        backup_path = self._quarantine_corrupt_file_unsafe()
+        if backup_path:
+            print(f"[SettingsManager] Повреждённый файл настроек сохранён как {backup_path}.")
+            self._post_event('settings_file_corrupted', {
+                'config_file': self.config_file,
+                'backup_path': backup_path,
+            })
+        return {}
+
+    def _quarantine_corrupt_file_unsafe(self):
+        """[Под замком] Уводит нечитаемый файл в сторону.
+
+        Иначе приложение поднимется на дефолтах и первым же автосохранением
+        уничтожит единственную копию настроек вместе с ключами.
+        """
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{self.config_file}.corrupt-{stamp}"
+        attempt = 1
+        while os.path.exists(backup_path):
+            backup_path = f"{self.config_file}.corrupt-{stamp}-{attempt}"
+            attempt += 1
+        try:
+            os.replace(self.config_file, backup_path)
+        except OSError as e:
+            print(f"[SettingsManager CRITICAL] Не удалось убрать повреждённый файл настроек: {e}")
+            return None
+        return backup_path

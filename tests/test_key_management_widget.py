@@ -1,0 +1,487 @@
+import os
+import unittest
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+from gemini_translator.api import config as api_config
+from gemini_translator.ui.widgets.key_management_widget import (
+    AdaptiveControlsWidget,
+    KeyManagementWidget,
+    MCP_PROVIDER_ID,
+)
+from gemini_translator.ui.widgets.mcp_control_widget import McpStatusSnapshot
+
+
+class _RecordingBus(QtCore.QObject):
+    """Шина с topic-подписками для проверки энергоэффективной фильтрации событий."""
+
+    event_posted = QtCore.pyqtSignal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self.subscriptions = {}
+
+    def subscribe(self, event_name, callback):
+        self.subscriptions.setdefault(event_name, []).append(callback)
+
+    def unsubscribe(self, event_name, callback):
+        callbacks = self.subscriptions.get(event_name, [])
+        if callback in callbacks:
+            callbacks.remove(callback)
+
+    def emit_topic(self, event_name, data=None):
+        event = {"event": event_name, "data": data or {}}
+        for callback in list(self.subscriptions.get(event_name, [])):
+            callback(event)
+
+
+class _KeySettingsStub:
+    config_dir = ""
+
+    def load_key_statuses(self):
+        return []
+
+    def is_key_limit_active(self, key_info, model_id):
+        return False
+
+    def get_request_count(self, key_info, model_id):
+        return 0
+
+
+class SetCurrentModelDedupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        api_config.initialize_configs()
+
+    def test_repeated_set_current_model_skips_restyle(self):
+        """При инициализации окна события провайдера/модели вызывают
+        set_current_model с одним и тем же id несколько раз подряд —
+        повторный вызов не должен заново перекрашивать весь список."""
+        widget = KeyManagementWidget(_KeySettingsStub())
+        self.addCleanup(widget.close)
+        calls = []
+        widget.update_key_styles_for_model = calls.append
+
+        widget.set_current_model("model-a")
+        widget.set_current_model("model-a")
+        widget.set_current_model("model-b")
+
+        self.assertEqual(calls, ["model-a", "model-b"])
+
+
+class _KeyStatusSettingsStub(_KeySettingsStub):
+    def __init__(self, provider_id):
+        self.provider_id = provider_id
+
+    def load_key_statuses(self):
+        return [
+            {"provider": self.provider_id, "key": "active-a"},
+            {"provider": self.provider_id, "key": "active-b"},
+            {"provider": self.provider_id, "key": "exhausted-c", "limited": True},
+        ]
+
+    def is_key_limit_active(self, key_info, model_id):
+        return bool(key_info.get("limited"))
+
+    def _get_status_for_model(self, key_info, model_id):
+        return {"exhausted_level": 2 if key_info.get("limited") else 0}
+
+    def get_key_reset_time_str(self, key_info, model_id):
+        return "Сброс позже"
+
+
+class _ServerManagerStub(QtCore.QObject):
+    server_status_changed = QtCore.pyqtSignal(bool, object)
+
+    def is_server_running(self):
+        return False
+
+
+class _CountingButton(QtWidgets.QPushButton):
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.style_calls = 0
+
+    def setStyleSheet(self, style):
+        self.style_calls += 1
+        super().setStyleSheet(style)
+
+
+class AdaptiveControlsWidgetTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_resize_with_same_style_bucket_does_not_reapply_button_styles(self):
+        arrow_buttons = [_CountingButton(text) for text in (">", "<", ">>", "<<")]
+        action_buttons = [_CountingButton(text) for text in ("Add", "Reset", "Force", "Delete")]
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+
+        widget = AdaptiveControlsWidget(arrow_buttons, action_buttons, separator)
+        host = QtWidgets.QWidget()
+        self.addCleanup(host.close)
+        layout = QtWidgets.QVBoxLayout(host)
+        layout.addWidget(widget)
+
+        # Trigger resize directly to avoid host.show() and event loop quirks on Windows
+        widget.resize(320, 300)
+        dummy_event = QtGui.QResizeEvent(QtCore.QSize(320, 300), QtCore.QSize(320, 300))
+        widget.resizeEvent(dummy_event)
+
+        initial_calls = sum(button.style_calls for button in arrow_buttons + action_buttons)
+        self.assertGreater(initial_calls, 0)
+
+        widget.resize(320, 305)
+        dummy_event = QtGui.QResizeEvent(QtCore.QSize(320, 305), QtCore.QSize(320, 300))
+        widget.resizeEvent(dummy_event)
+
+        repeated_calls = sum(button.style_calls for button in arrow_buttons + action_buttons)
+        self.assertEqual(repeated_calls, initial_calls)
+
+        widget.resize(320, 420)
+        dummy_event = QtGui.QResizeEvent(QtCore.QSize(320, 420), QtCore.QSize(320, 305))
+        widget.resizeEvent(dummy_event)
+
+        changed_calls = sum(button.style_calls for button in arrow_buttons + action_buttons)
+        self.assertGreater(changed_calls, repeated_calls)
+
+
+class KeyManagementWidgetProviderModeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def setUp(self):
+        api_config.initialize_configs()
+
+    def _key_action_buttons(self, widget):
+        return (
+            widget.add_selected_btn,
+            widget.remove_selected_btn,
+            widget.add_all_btn,
+            widget.remove_all_btn,
+            widget.add_from_text_btn,
+            widget.reset_selected_btn,
+            widget.force_exhaust_btn,
+            widget.remove_from_pool_btn,
+        )
+
+    def _first_api_key_provider_index(self, widget):
+        for index in range(widget.provider_combo.count()):
+            provider_id = widget.provider_combo.itemData(index)
+            if (
+                provider_id != MCP_PROVIDER_ID
+                and api_config.provider_requires_api_key(provider_id)
+            ):
+                return index
+        self.fail("No visible API-key provider found")
+
+    def test_subscribes_only_to_relevant_topics(self):
+        bus = _RecordingBus()
+        old_bus = getattr(self.app, "event_bus", None)
+        self.app.event_bus = bus
+        try:
+            widget = KeyManagementWidget(_KeySettingsStub())
+            self.addCleanup(widget.close)
+
+            for topic in (
+                "key_statuses_updated",
+                "model_changed",
+                "session_started",
+                "request_count_updated",
+                "fatal_error",
+            ):
+                self.assertIn(topic, bus.subscriptions)
+            # Энергоэффективность: не будимся на самое частое широковещательное событие.
+            self.assertNotIn("log_message", bus.subscriptions)
+
+            # Функционал сохраняется: целевое событие по-прежнему обрабатывается.
+            bus.emit_topic(
+                "session_started",
+                {"settings": {"model_config": {"id": "m-42"}}},
+            )
+            self.assertEqual(widget.current_model_id, "m-42")
+        finally:
+            if old_bus is None:
+                if hasattr(self.app, "event_bus"):
+                    delattr(self.app, "event_bus")
+            else:
+                self.app.event_bus = old_bus
+
+    def test_local_provider_uses_virtual_session_without_api_key(self):
+        widget = KeyManagementWidget(_KeySettingsStub())
+        self.addCleanup(widget.close)
+
+        widget.set_active_keys_for_provider("local", [])
+
+        self.assertFalse(api_config.provider_requires_api_key("local"))
+        self.assertEqual(widget.get_active_keys(), ["__local_model_session__"])
+        self.assertEqual(widget.active_keys_list.count(), 1)
+        self.assertIn("Локальная сессия", widget.active_keys_list.item(0).text())
+        self.assertFalse(widget.available_keys_list.isEnabled())
+
+    def test_key_status_is_rendered_as_provider_card(self):
+        first_provider_id = next(
+            provider_id
+            for provider_id, provider in api_config.api_providers().items()
+            if provider.get("visible", True)
+            and api_config.provider_requires_api_key(provider_id)
+        )
+        widget = KeyManagementWidget(_KeyStatusSettingsStub(first_provider_id))
+        self.addCleanup(widget.close)
+
+        card = widget.findChild(QtWidgets.QFrame, "keyStatusCard")
+        self.assertIsNotNone(card)
+        self.assertEqual(widget.key_total_value_label.text(), "3")
+        self.assertEqual(widget.key_available_value_label.text(), "2")
+        self.assertEqual(widget.key_exhausted_value_label.text(), "1")
+        self.assertFalse(widget.findChildren(QtWidgets.QLabel, "keyStatusDetail"))
+
+    def test_key_legend_chips_use_real_key_status_states(self):
+        widget = KeyManagementWidget(_KeySettingsStub())
+        self.addCleanup(widget.close)
+
+        chips = widget.findChildren(QtWidgets.QLabel, "keyLegendChip")
+        states_by_text = {chip.text(): chip.property("state") for chip in chips}
+
+        self.assertEqual(states_by_text["Активный"], "active")
+        self.assertEqual(states_by_text["Пауза"], "paused")
+        self.assertEqual(states_by_text["Исчерпан"], "exhausted")
+
+    def test_provider_combo_contains_mcp_server_item(self):
+        widget = KeyManagementWidget(_KeySettingsStub())
+        self.addCleanup(widget.close)
+
+        mcp_index = widget.provider_combo.findData(MCP_PROVIDER_ID)
+
+        self.assertGreaterEqual(mcp_index, 0)
+        self.assertEqual(widget.provider_combo.itemText(mcp_index), "MCP сервер")
+
+    def test_mcp_provider_swaps_key_status_for_mcp_card_without_changing_selected_provider(self):
+        widget = KeyManagementWidget(
+            _KeySettingsStub(),
+            server_manager=_ServerManagerStub(),
+        )
+        self.addCleanup(widget.close)
+        widget.mcp_control_card.refresh_status = lambda: None
+
+        api_provider_index = self._first_api_key_provider_index(widget)
+        widget.provider_combo.setCurrentIndex(api_provider_index)
+        previous_provider_id = widget.get_selected_provider()
+        self.assertTrue(api_config.provider_requires_api_key(previous_provider_id))
+        mcp_index = widget.provider_combo.findData(MCP_PROVIDER_ID)
+        self.assertGreaterEqual(mcp_index, 0)
+
+        widget.provider_combo.setCurrentIndex(mcp_index)
+
+        self.assertEqual(widget.get_selected_provider(), previous_provider_id)
+        self.assertTrue(widget.key_status_card.isHidden())
+        self.assertFalse(widget.mcp_control_card.isHidden())
+        self.assertTrue(widget.server_button.isHidden())
+        self.assertFalse(widget.available_keys_group.isEnabled())
+        self.assertFalse(widget.active_keys_group.isEnabled())
+        for button in self._key_action_buttons(widget):
+            with self.subTest(button=button.text()):
+                self.assertFalse(button.isEnabled())
+
+        widget.provider_combo.setCurrentIndex(api_provider_index)
+
+        self.assertFalse(widget.key_status_card.isHidden())
+        self.assertTrue(widget.mcp_control_card.isHidden())
+        self.assertTrue(widget.available_keys_group.isEnabled())
+        self.assertTrue(widget.active_keys_group.isEnabled())
+        for button in self._key_action_buttons(widget):
+            with self.subTest(button=button.text()):
+                self.assertTrue(button.isEnabled())
+
+    def test_mcp_provider_hides_key_lists_without_losing_real_provider_selection(self):
+        provider_id = next(
+            provider_id
+            for provider_id, provider in api_config.api_providers().items()
+            if provider.get("visible", True)
+            and api_config.provider_requires_api_key(provider_id)
+        )
+        widget = KeyManagementWidget(
+            _KeyStatusSettingsStub(provider_id),
+            server_manager=_ServerManagerStub(),
+        )
+        self.addCleanup(widget.close)
+        widget.mcp_control_card.refresh_status = lambda: None
+        widget.set_active_keys_for_provider(provider_id, ["active-a"])
+        self.assertEqual(widget.active_keys_list.count(), 1)
+        self.assertGreater(widget.available_keys_list.count(), 0)
+
+        widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+
+        self.assertEqual(widget.get_selected_provider(), provider_id)
+        self.assertEqual(widget.available_keys_list.count(), 0)
+        self.assertEqual(widget.active_keys_list.count(), 0)
+        self.assertEqual(widget.active_key_count_label.text(), "Выбрано: 0")
+        self.assertIn("MCP", widget.active_empty_label.text())
+
+        widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(provider_id))
+
+        self.assertEqual(widget.active_keys_list.count(), 1)
+        self.assertEqual(
+            widget.active_keys_list.item(0).data(QtCore.Qt.ItemDataRole.UserRole),
+            "active-a",
+        )
+        self.assertGreater(widget.available_keys_list.count(), 0)
+
+    def test_mcp_provider_can_start_ai_session_when_client_connected(self):
+        widget = KeyManagementWidget(
+            _KeySettingsStub(),
+            server_manager=_ServerManagerStub(),
+        )
+        self.addCleanup(widget.close)
+        widget.mcp_control_card.refresh_status = lambda: None
+
+        widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+
+        self.assertFalse(widget.can_start_ai_session())
+
+        widget.mcp_control_card.apply_status(
+            McpStatusSnapshot(running=True, detail="127.0.0.1:6543", connected_clients=1)
+        )
+
+        self.assertTrue(widget.can_start_ai_session())
+
+    def test_mcp_provider_returns_virtual_key_only_when_client_connected(self):
+        widget = KeyManagementWidget(
+            _KeySettingsStub(),
+            server_manager=_ServerManagerStub(),
+        )
+        self.addCleanup(widget.close)
+        widget.mcp_control_card.refresh_status = lambda: None
+
+        widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+
+        self.assertEqual(widget.get_active_keys(), [])
+
+        widget.mcp_control_card.apply_status(
+            McpStatusSnapshot(running=True, detail="127.0.0.1:65016", connected_clients=1)
+        )
+
+        self.assertEqual(
+            widget.get_active_keys(),
+            [api_config.provider_placeholder_api_key(MCP_PROVIDER_ID)],
+        )
+
+    def test_mcp_to_local_restores_groups_but_keeps_key_actions_disabled(self):
+        widget = KeyManagementWidget(
+            _KeySettingsStub(),
+            server_manager=_ServerManagerStub(),
+        )
+        self.addCleanup(widget.close)
+        widget.mcp_control_card.refresh_status = lambda: None
+
+        local_index = widget.provider_combo.findData("local")
+        if local_index < 0:
+            self.skipTest("local provider is not visible")
+
+        widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+        widget.provider_combo.setCurrentIndex(local_index)
+
+        self.assertEqual(widget.get_selected_provider(), "local")
+        self.assertTrue(widget.available_keys_group.isEnabled())
+        self.assertTrue(widget.active_keys_group.isEnabled())
+        for button in self._key_action_buttons(widget):
+            with self.subTest(button=button.text()):
+                self.assertFalse(button.isEnabled())
+
+    def test_mcp_provider_selection_does_not_emit_provider_changed(self):
+        bus = _RecordingBus()
+        old_bus = getattr(self.app, "event_bus", None)
+        self.app.event_bus = bus
+        emitted_events = []
+        bus.event_posted.connect(emitted_events.append)
+        try:
+            widget = KeyManagementWidget(_KeySettingsStub())
+            self.addCleanup(widget.close)
+            widget.mcp_control_card.refresh_status = lambda: None
+            emitted_events.clear()
+
+            widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+
+            self.assertEqual(
+                [],
+                [event for event in emitted_events if event.get("event") == "provider_changed"],
+            )
+        finally:
+            bus.event_posted.disconnect(emitted_events.append)
+            if old_bus is None:
+                if hasattr(self.app, "event_bus"):
+                    delattr(self.app, "event_bus")
+            else:
+                self.app.event_bus = old_bus
+
+    def test_mcp_provider_selection_exposes_raw_ai_mode_event(self):
+        bus = _RecordingBus()
+        old_bus = getattr(self.app, "event_bus", None)
+        self.app.event_bus = bus
+        emitted_events = []
+        bus.event_posted.connect(emitted_events.append)
+        try:
+            widget = KeyManagementWidget(_KeySettingsStub())
+            self.addCleanup(widget.close)
+            widget.mcp_control_card.refresh_status = lambda: None
+            emitted_events.clear()
+
+            widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+
+            self.assertTrue(widget.is_mcp_provider_selected())
+            self.assertEqual(widget.get_raw_selected_provider(), MCP_PROVIDER_ID)
+            mcp_events = [
+                event
+                for event in emitted_events
+                if event.get("event") == "ai_provider_mode_changed"
+            ]
+            self.assertEqual(len(mcp_events), 1)
+            self.assertEqual(mcp_events[0]["data"]["provider_id"], MCP_PROVIDER_ID)
+            self.assertTrue(mcp_events[0]["data"]["is_mcp"])
+        finally:
+            bus.event_posted.disconnect(emitted_events.append)
+            if old_bus is None:
+                if hasattr(self.app, "event_bus"):
+                    delattr(self.app, "event_bus")
+            else:
+                self.app.event_bus = old_bus
+
+    def test_shared_ai_surfaces_still_use_key_management_widget(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        shared_surfaces = (
+            "gemini_translator/ui/dialogs/setup.py",
+            "gemini_translator/ui/dialogs/glossary_dialogs/ai_generation.py",
+            "gemini_translator/ui/dialogs/glossary_dialogs/ai_correction.py",
+            "gemini_translator/ui/dialogs/validation_dialogs/untranslated_fixer_dialog.py",
+            "gemini_translator/ui/dialogs/consistency_checker.py",
+        )
+
+        for surface in shared_surfaces:
+            with self.subTest(surface=surface):
+                self.assertIn("KeyManagementWidget", (repo_root / surface).read_text(encoding="utf-8"))
+
+    def test_key_status_card_layout_policies(self):
+        widget = KeyManagementWidget(_KeySettingsStub())
+        self.addCleanup(widget.close)
+
+        card = widget.findChild(QtWidgets.QFrame, "keyStatusCard")
+        self.assertIsNotNone(card)
+        # Должен быть Minimum, Minimum (без фикс. ширины 260)
+        self.assertEqual(card.sizePolicy().horizontalPolicy(), QtWidgets.QSizePolicy.Policy.Minimum)
+        self.assertEqual(card.sizePolicy().verticalPolicy(), QtWidgets.QSizePolicy.Policy.Minimum)
+        # Убеждаемся, что minimumWidth не задан жестко
+        self.assertEqual(card.minimumWidth(), 0)
+
+        layout = card.layout()
+        # Проверяем, что первый столбец не имеет принудительного растяжения (stretch 0)
+        self.assertEqual(layout.stretch(1), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
