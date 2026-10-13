@@ -123,8 +123,8 @@ chmod +x build_translator_linux.sh
 Если нужен полностью ручной сценарий:
 
 ```bash
-git clone https://github.com/primalrin/translatorFork_MOD.git
-cd translatorFork_MOD
+git clone https://github.com/zeusreed/translatorFork_MOD-10.5.23.git
+cd translatorFork_MOD-10.5.23
 python -m venv .venv
 ```
 
@@ -133,7 +133,7 @@ Windows:
 ```bat
 .venv\Scripts\activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements.lock
 python main.py
 ```
 
@@ -142,7 +142,7 @@ Linux / macOS:
 ```bash
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements.lock
 python main.py
 ```
 
